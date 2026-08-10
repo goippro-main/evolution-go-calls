@@ -1,79 +1,95 @@
-// pkg/call/stream/bridge.go
 package call_stream
 
 import (
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 	"github.com/purpshell/meowcaller"
 )
 
-// wsMessage is the JSON envelope carried over the stream socket, modeled on Twilio
-// Media Streams so existing AI-voice integrations need minimal adapting.
+const maxQueuedAudioFrames = 50
+
+// wsMessage is the JSON envelope used by the audio-only media bridge. Audio is
+// always mono, 16 kHz, PCM16LE, with one 960-sample frame per message.
 type wsMessage struct {
 	Event      string `json:"event"`
 	CallID     string `json:"callId,omitempty"`
 	SampleRate int    `json:"sampleRate,omitempty"`
-	Video      bool   `json:"video,omitempty"`
 	Track      string `json:"track,omitempty"`
 	Payload    string `json:"payload,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 }
 
-// bridge adapts one WebSocket connection to meowcaller's AudioSink (Call.Receive),
-// VideoSink (Call.ReceiveVideo), and AudioSource (Call.Play) interfaces, so a single
-// object plugs a call's media straight into the socket in both directions.
 type bridge struct {
-	conn      *websocket.Conn
-	writeMu   sync.Mutex
-	incoming  chan []float32
-	closed    chan struct{}
-	closeOnce sync.Once
+	conn         *websocket.Conn
+	writeMu      sync.Mutex
+	incoming     chan []float32
+	closed       chan struct{}
+	ready        chan struct{}
+	closeOnce    sync.Once
+	readyOnce    sync.Once
+	inboundReady atomic.Bool
 }
 
 func newBridge(conn *websocket.Conn) *bridge {
 	return &bridge{
-		conn: conn,
-		// ~3 seconds of buffering at one 60ms frame per slot before frames start
-		// getting dropped — enough slack for scheduling jitter without unbounded growth.
-		incoming: make(chan []float32, 50),
+		conn:     conn,
+		incoming: make(chan []float32, maxQueuedAudioFrames),
 		closed:   make(chan struct{}),
+		ready:    make(chan struct{}),
 	}
 }
 
+func (b *bridge) allowInbound() {
+	b.readyOnce.Do(func() { close(b.ready) })
+	b.inboundReady.Store(true)
+}
+
 func (b *bridge) writeJSON(msg wsMessage) error {
+	if b.conn == nil {
+		return errors.New("call stream: websocket is nil")
+	}
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
 	return b.conn.WriteJSON(msg)
 }
 
-// writeStart sends the initial handshake message once the socket is up.
-func (b *bridge) writeStart(callID string, video bool) {
-	_ = b.writeJSON(wsMessage{
+func (b *bridge) writeStart(callID string) error {
+	return b.writeJSON(wsMessage{
 		Event:      "start",
 		CallID:     callID,
 		SampleRate: meowcaller.SampleRate,
-		Video:      video,
 	})
 }
 
-// WriteFrame implements meowcaller.AudioSink: one decoded mono frame from the peer.
+// WriteFrame implements meowcaller.AudioSink. Frames received before the call
+// becomes active are deliberately discarded; they must never be exposed as live
+// media to an operator client.
 func (b *bridge) WriteFrame(frame []float32) error {
+	if !b.inboundReady.Load() {
+		return nil
+	}
+	if len(frame) != meowcaller.FrameSamples {
+		return fmt.Errorf("call stream: inbound frame has %d samples, want %d", len(frame), meowcaller.FrameSamples)
+	}
 	payload := base64.StdEncoding.EncodeToString(pcm16FromFloat32(frame))
 	return b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
 }
 
-// WriteVideo implements meowcaller.VideoSink: one Annex-B H.264 access unit.
-func (b *bridge) WriteVideo(accessUnit []byte) error {
-	payload := base64.StdEncoding.EncodeToString(accessUnit)
-	return b.writeJSON(wsMessage{Event: "video", Track: "inbound", Payload: payload})
-}
-
-// ReadFrame implements meowcaller.AudioSource: frames the consumer sent back over the
-// socket, decoded by readLoop and handed here on demand.
+// ReadFrame implements meowcaller.AudioSource. It does not release a client
+// supplied frame to meowcaller until the call is active.
 func (b *bridge) ReadFrame() ([]float32, error) {
+	select {
+	case <-b.ready:
+	case <-b.closed:
+		return nil, io.EOF
+	}
+
 	select {
 	case frame, ok := <-b.incoming:
 		if !ok {
@@ -85,42 +101,72 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 	}
 }
 
-// Close satisfies AudioSink/VideoSink/AudioSource's shared Close() error method. Safe
-// to call more than once (from the call's OnEnd callback and from readLoop exiting).
+// Close satisfies AudioSink and AudioSource. It is safe for callbacks, the
+// websocket reader, and the HTTP handler to call concurrently.
 func (b *bridge) Close() error {
 	b.closeOnce.Do(func() {
-		_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
+		if b.conn != nil {
+			_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
+		}
 		close(b.closed)
-		_ = b.conn.Close()
+		if b.conn != nil {
+			_ = b.conn.Close()
+		}
 	})
 	return nil
 }
 
-// readLoop blocks reading consumer-sent media messages until the connection closes
-// (by either side) or send Close(). Every non-media message is ignored rather than
-// erroring, so the wire format can grow new event types without breaking old clients.
-func (b *bridge) readLoop() {
+func decodeOutboundAudio(msg wsMessage) ([]float32, error) {
+	if msg.SampleRate != 0 && msg.SampleRate != meowcaller.SampleRate {
+		return nil, fmt.Errorf("call stream: unsupported sample rate %d", msg.SampleRate)
+	}
+	if msg.Payload == "" {
+		return nil, errors.New("call stream: media payload is empty")
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("call stream: invalid base64 payload: %w", err)
+	}
+	wantBytes := meowcaller.FrameSamples * 2
+	if len(raw) != wantBytes {
+		return nil, fmt.Errorf("call stream: media payload has %d PCM bytes, want %d", len(raw), wantBytes)
+	}
+	return float32FromPCM16(raw), nil
+}
+
+// readLoop is the sole websocket reader. Writers use writeJSON's mutex, so
+// meowcaller's receive callbacks and this goroutine never write concurrently.
+func (b *bridge) readLoop() error {
 	for {
 		var msg wsMessage
 		if err := b.conn.ReadJSON(&msg); err != nil {
 			b.Close()
-			return
+			return err
 		}
-		if msg.Event != "media" || msg.Track != "outbound" {
+		switch {
+		case msg.Event == "stop":
+			b.Close()
+			return nil
+		case msg.Event != "media" || msg.Track != "outbound":
+			// Unknown events are ignored for forwards compatibility.
 			continue
 		}
-		raw, err := base64.StdEncoding.DecodeString(msg.Payload)
+
+		frame, err := decodeOutboundAudio(msg)
 		if err != nil {
+			b.Close()
+			return err
+		}
+		if !b.inboundReady.Load() {
 			continue
 		}
-		frame := float32FromPCM16(raw)
 		select {
 		case b.incoming <- frame:
 		case <-b.closed:
-			return
+			return io.EOF
 		default:
-			// Consumer is sending audio faster than the call can play it out; drop
-			// the frame rather than block the socket read loop.
+			// Drop newest input under backpressure instead of blocking the websocket
+			// reader and starving call teardown/control messages.
 		}
 	}
 }

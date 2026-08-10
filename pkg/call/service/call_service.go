@@ -3,6 +3,7 @@ package call_service
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	call_registry "github.com/evolution-foundation/evolution-go/pkg/call/registry"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -19,8 +20,12 @@ type CallService interface {
 	AnswerCall(data *AnswerCallStruct, instance *instance_model.Instance) (*meowcaller.Call, error)
 	HangupCall(data *HangupCallStruct, instance *instance_model.Instance) error
 	GetActiveCall(instanceId, callId string) (*meowcaller.Call, error)
+	ForgetActiveCall(instanceId, callId string, call *meowcaller.Call)
+	IsOutgoingCall(instanceId, callId string) bool
 	DialCall(data *DialCallStruct, instance *instance_model.Instance) (*meowcaller.Call, error)
 }
+
+var ErrCallNotFound = errors.New("call not found")
 
 type callService struct {
 	clientPointer    map[string]*whatsmeow.Client
@@ -49,21 +54,19 @@ type HangupCallStruct struct {
 // phone number, a phone JID, or an @lid JID).
 type DialCallStruct struct {
 	Number string `json:"number"`
-	Video  bool   `json:"video"`
 }
 
 func (c *callService) RejectCall(data *RejectCallStruct, instance *instance_model.Instance) error {
 	call, ok := c.callRegistry.Get(instance.Id, data.CallID)
 	if !ok {
-		return errors.New("no pending call with that id")
+		return fmt.Errorf("%w: no pending call with that id", ErrCallNotFound)
 	}
 
-	err := call.Reject()
-	c.callRegistry.Delete(data.CallID)
-	if err != nil {
+	if err := call.Reject(); err != nil {
 		logger.LogError("[%s] error reject call: %v", instance.Id, err)
 		return err
 	}
+	c.callRegistry.DeleteIf(instance.Id, data.CallID, call)
 
 	return nil
 }
@@ -71,7 +74,7 @@ func (c *callService) RejectCall(data *RejectCallStruct, instance *instance_mode
 func (c *callService) AnswerCall(data *AnswerCallStruct, instance *instance_model.Instance) (*meowcaller.Call, error) {
 	call, ok := c.callRegistry.Get(instance.Id, data.CallID)
 	if !ok {
-		return nil, errors.New("no pending call with that id")
+		return nil, fmt.Errorf("%w: no pending call with that id", ErrCallNotFound)
 	}
 
 	// Answer negotiates media for whatever the offer already declared (audio, or
@@ -90,24 +93,31 @@ func (c *callService) AnswerCall(data *AnswerCallStruct, instance *instance_mode
 func (c *callService) HangupCall(data *HangupCallStruct, instance *instance_model.Instance) error {
 	call, ok := c.callRegistry.Get(instance.Id, data.CallID)
 	if !ok {
-		return errors.New("no active call with that id")
+		return fmt.Errorf("%w: no active call with that id", ErrCallNotFound)
 	}
 
-	err := call.Hangup()
-	c.callRegistry.Delete(data.CallID)
-	if err != nil {
+	if err := call.Hangup(); err != nil {
 		logger.LogError("[%s] error hanging up call: %v", instance.Id, err)
 		return err
 	}
+	c.callRegistry.DeleteIf(instance.Id, data.CallID, call)
 	return nil
 }
 
 func (c *callService) GetActiveCall(instanceId, callId string) (*meowcaller.Call, error) {
 	call, ok := c.callRegistry.Get(instanceId, callId)
 	if !ok {
-		return nil, errors.New("no active call with that id")
+		return nil, fmt.Errorf("%w: no active call with that id", ErrCallNotFound)
 	}
 	return call, nil
+}
+
+func (c *callService) ForgetActiveCall(instanceID, callID string, call *meowcaller.Call) {
+	c.callRegistry.DeleteIf(instanceID, callID, call)
+}
+
+func (c *callService) IsOutgoingCall(instanceId, callId string) bool {
+	return c.callRegistry.IsOutgoing(instanceId, callId)
 }
 
 // DialCall places an outbound call and registers it so /call/stream and
@@ -118,13 +128,13 @@ func (c *callService) DialCall(data *DialCallStruct, instance *instance_model.In
 		return nil, err
 	}
 
-	call, err := meowcallerClient.CallWithOptions(context.Background(), data.Number, meowcaller.CallOptions{Video: data.Video})
+	call, err := meowcallerClient.Call(context.Background(), data.Number)
 	if err != nil {
 		logger.LogError("[%s] error dialing call: %v", instance.Id, err)
 		return nil, err
 	}
 
-	c.callRegistry.Store(instance.Id, call)
+	c.callRegistry.StoreOutgoing(instance.Id, call)
 
 	return call, nil
 }

@@ -94,6 +94,7 @@ type whatsmeowService struct {
 	userInfoCache      *cache.Cache
 	clientPointer      map[string]*whatsmeow.Client
 	meowcallerPointer  map[string]*meowcaller.Client
+	meowcallerMu       *sync.RWMutex
 	callRegistry       *call_registry.CallRegistry
 	myClientPointer    map[string]*MyClient
 	rabbitmqProducer   producer_interfaces.Producer
@@ -217,7 +218,15 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 
 	// Remover das estruturas
 	delete(w.clientPointer, instanceId)
+	if w.meowcallerMu != nil {
+		w.meowcallerMu.Lock()
+		delete(w.meowcallerPointer, instanceId)
+		w.meowcallerMu.Unlock()
+	}
 	delete(w.myClientPointer, instanceId)
+	if w.callRegistry != nil {
+		w.callRegistry.DeleteInstance(instanceId)
+	}
 	delete(w.killChannel, instanceId)
 
 	// Limpar cache de userInfo para esta instância
@@ -426,7 +435,13 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	// meowcaller.NewClient must run before client.Connect() — it installs the raw
 	// <call> stanza adapter, and doing so after Connect() is a documented race.
 	meowcallerClient := meowcaller.NewClient(client)
-	w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
+	if w.meowcallerMu != nil {
+		w.meowcallerMu.Lock()
+		w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
+		w.meowcallerMu.Unlock()
+	} else {
+		w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
+	}
 	instanceID := cd.Instance.Id
 	meowcallerClient.OnIncomingCall(func(call *meowcaller.Call) {
 		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] meowcaller captured incoming call %s from %s", instanceID, call.ID(), call.Peer().String())
@@ -1959,7 +1974,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "CallTerminate"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call terminate %+v", mycli.userID, evt)
-		mycli.service.(*whatsmeowService).callRegistry.Delete(evt.CallID)
+		if service, ok := mycli.service.(*whatsmeowService); ok && service.callRegistry != nil {
+			service.callRegistry.Delete(evt.CallID)
+		}
 	case *events.CallOfferNotice:
 		doWebhook = true
 		postMap["event"] = "CallOfferNotice"
@@ -1975,6 +1992,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "ConnectFailure"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Connection failed with reason %s", mycli.userID, evt.Reason.String())
+		if service, ok := mycli.service.(*whatsmeowService); ok && service.callRegistry != nil {
+			service.callRegistry.DeleteInstance(mycli.userID)
+		}
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -1989,6 +2009,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Disconnected:
 		doWebhook = true
 		postMap["event"] = "Disconnected"
+		if service, ok := mycli.service.(*whatsmeowService); ok && service.callRegistry != nil {
+			service.callRegistry.DeleteInstance(mycli.userID)
+		}
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -2793,6 +2816,15 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client pointer cleared", instanceId)
 	}
 
+	if w.meowcallerMu != nil {
+		w.meowcallerMu.Lock()
+		delete(w.meowcallerPointer, instanceId)
+		w.meowcallerMu.Unlock()
+	}
+	if w.callRegistry != nil {
+		w.callRegistry.DeleteInstance(instanceId)
+	}
+
 	// Limpar killChannel se existir
 	if killChan, exists := w.killChannel[instanceId]; exists {
 		select {
@@ -2842,6 +2874,7 @@ func NewWhatsmeowService(
 		userInfoCache:      cache.New(5*time.Minute, 10*time.Minute),
 		clientPointer:      clientPointer,
 		meowcallerPointer:  make(map[string]*meowcaller.Client),
+		meowcallerMu:       &sync.RWMutex{},
 		callRegistry:       callRegistry,
 		myClientPointer:    make(map[string]*MyClient),
 		rabbitmqProducer:   rabbitmqProducer,
@@ -2865,6 +2898,10 @@ func (w *whatsmeowService) GetPollService() poll_service.PollService {
 // GetMeowcallerClient returns the meowcaller client for instanceId, if its
 // whatsmeow client has been started.
 func (w *whatsmeowService) GetMeowcallerClient(instanceId string) (*meowcaller.Client, error) {
+	if w.meowcallerMu != nil {
+		w.meowcallerMu.RLock()
+		defer w.meowcallerMu.RUnlock()
+	}
 	client, ok := w.meowcallerPointer[instanceId]
 	if !ok || client == nil {
 		return nil, fmt.Errorf("no active meowcaller client for instance %s", instanceId)

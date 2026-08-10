@@ -26,6 +26,19 @@
   <a href="https://github.com/luis-kovi/evolution-go-calls/pull/1">Call PR</a>
 </p>
 
+## Rekovi call-stream build provenance
+
+The Rekovi call-control build is based on upstream pull request
+[`evolution-foundation/evolution-go#141`](https://github.com/evolution-foundation/evolution-go/pull/141),
+pinned to commit `51ca5e1588b1def67ca78d945e85f8642198f8fe` (26 commits) so later updates or
+force-pushes to the open PR cannot silently change a production build.
+
+`POST /call/dial` is experimental code outside the reviewed answer-call design. This
+branch exposes audio calls only; video and participant-add paths are intentionally out
+of scope. Browser/operator clients should use a short-lived HMAC stream URL generated
+by a trusted backend, never an Evolution instance API key.
+
+
 ---
 
 ## About

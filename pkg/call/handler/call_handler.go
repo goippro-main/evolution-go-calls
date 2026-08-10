@@ -1,6 +1,7 @@
 package call_handler
 
 import (
+	"errors"
 	"net/http"
 
 	call_service "github.com/evolution-foundation/evolution-go/pkg/call/service"
@@ -17,6 +18,14 @@ type CallHandler interface {
 
 type callHandler struct {
 	callService call_service.CallService
+}
+
+func writeCallError(ctx *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, call_service.ErrCallNotFound) {
+		status = http.StatusNotFound
+	}
+	ctx.JSON(status, gin.H{"error": err.Error()})
 }
 
 // Reject call
@@ -47,7 +56,7 @@ func (g *callHandler) RejectCall(ctx *gin.Context) {
 
 	err = g.callService.RejectCall(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCallError(ctx, err)
 		return
 	}
 
@@ -82,7 +91,7 @@ func (g *callHandler) AnswerCall(ctx *gin.Context) {
 
 	_, err = g.callService.AnswerCall(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCallError(ctx, err)
 		return
 	}
 
@@ -117,7 +126,7 @@ func (g *callHandler) HangupCall(ctx *gin.Context) {
 
 	err = g.callService.HangupCall(data, instance)
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeCallError(ctx, err)
 		return
 	}
 
