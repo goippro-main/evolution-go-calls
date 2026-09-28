@@ -93,9 +93,14 @@ func (r *CallRegistry) DeleteInstance(instanceID string) int {
 	return removed
 }
 
-// Delete removes callID regardless of which instance it belongs to.
-func (r *CallRegistry) Delete(callID string) {
+// DeleteForInstance removes a call only when it belongs to instanceID.
+func (r *CallRegistry) DeleteForInstance(instanceID, callID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	e, ok := r.entries[callID]
+	if !ok || e.instanceID != instanceID {
+		return false
+	}
 	delete(r.entries, callID)
+	return true
 }

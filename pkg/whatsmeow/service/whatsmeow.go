@@ -1975,7 +1975,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "CallTerminate"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call terminate %+v", mycli.userID, evt)
 		if service, ok := mycli.service.(*whatsmeowService); ok && service.callRegistry != nil {
-			service.callRegistry.Delete(evt.CallID)
+			service.callRegistry.DeleteForInstance(mycli.userID, evt.CallID)
 		}
 	case *events.CallOfferNotice:
 		doWebhook = true

@@ -3,6 +3,7 @@ package call_handler
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	call_service "github.com/evolution-foundation/evolution-go/pkg/call/service"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -26,6 +27,14 @@ func writeCallError(ctx *gin.Context, err error) {
 		status = http.StatusNotFound
 	}
 	ctx.JSON(status, gin.H{"error": err.Error()})
+}
+
+func requireCallID(ctx *gin.Context, callID string) bool {
+	if strings.TrimSpace(callID) != "" {
+		return true
+	}
+	ctx.JSON(http.StatusBadRequest, gin.H{"error": "callId is required"})
+	return false
 }
 
 // Reject call
@@ -53,6 +62,9 @@ func (g *callHandler) RejectCall(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if data == nil || !requireCallID(ctx, data.CallID) {
+		return
+	}
 
 	err = g.callService.RejectCall(data, instance)
 	if err != nil {
@@ -65,7 +77,7 @@ func (g *callHandler) RejectCall(ctx *gin.Context) {
 
 // Answer call
 // @Summary Answer call
-// @Description Answer an incoming call and (if it's a video call) accept its video
+// @Description Answer an incoming audio call
 // @Tags Call
 // @Accept json
 // @Produce json
@@ -86,6 +98,9 @@ func (g *callHandler) AnswerCall(ctx *gin.Context) {
 	err := ctx.ShouldBindBodyWithJSON(&data)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if data == nil || !requireCallID(ctx, data.CallID) {
 		return
 	}
 
@@ -123,6 +138,9 @@ func (g *callHandler) HangupCall(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if data == nil || !requireCallID(ctx, data.CallID) {
+		return
+	}
 
 	err = g.callService.HangupCall(data, instance)
 	if err != nil {
@@ -156,6 +174,10 @@ func (g *callHandler) DialCall(ctx *gin.Context) {
 	err := ctx.ShouldBindBodyWithJSON(&data)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if data == nil || strings.TrimSpace(data.Number) == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "number is required"})
 		return
 	}
 

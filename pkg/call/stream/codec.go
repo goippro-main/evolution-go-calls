@@ -1,7 +1,10 @@
 // pkg/call/stream/codec.go
 package call_stream
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // pcm16FromFloat32 converts one mono PCM frame (as meowcaller delivers it: float32
 // samples in [-1, 1]) into little-endian 16-bit PCM bytes, clamping out-of-range
@@ -9,6 +12,9 @@ import "encoding/binary"
 func pcm16FromFloat32(frame []float32) []byte {
 	out := make([]byte, len(frame)*2)
 	for i, s := range frame {
+		if math.IsNaN(float64(s)) {
+			s = 0
+		}
 		v := s * 32768.0
 		if v > 32767 {
 			v = 32767

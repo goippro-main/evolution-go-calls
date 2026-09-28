@@ -36,7 +36,7 @@ func TestDeleteRemovesEntry(t *testing.T) {
 	r := NewCallRegistry()
 	call := &meowcaller.Call{}
 	r.Store("instance-a", call)
-	r.Delete(callIDOf(call))
+	r.DeleteForInstance("instance-a", callIDOf(call))
 
 	_, ok := r.Get("instance-a", callIDOf(call))
 	if ok {

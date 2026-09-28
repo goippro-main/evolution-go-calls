@@ -7,7 +7,7 @@
 <h1 align="center">Evolution Go Calls</h1>
 
 <p align="center">
-  A call-focused Evolution Go fork for programmable WhatsApp calling, real-time media streaming, and secure AI voice integrations.
+  A call-focused Evolution Go fork for programmable WhatsApp calling and secure real-time audio transport.
 </p>
 
 <p align="center">
@@ -28,10 +28,10 @@
 
 ## Rekovi call-stream build provenance
 
-The Rekovi call-control build is based on upstream pull request
-[`evolution-foundation/evolution-go#141`](https://github.com/evolution-foundation/evolution-go/pull/141),
-pinned to commit `51ca5e1588b1def67ca78d945e85f8642198f8fe` (26 commits) so later updates or
-force-pushes to the open PR cannot silently change a production build.
+This branch starts from the call implementation proposed in source-fork PR
+[`luis-kovi/evolution-go-calls#1`](https://github.com/luis-kovi/evolution-go-calls/pull/1),
+whose reviewed head was `e21ce0dd7634f3047410c893b5e4d1c082034b84`. The branch then
+keeps only the audio transport surface and adds lifecycle, validation, and test hardening.
 
 `POST /call/dial` is experimental code outside the reviewed answer-call design. This
 branch exposes audio calls only; video and participant-add paths are intentionally out
@@ -45,12 +45,12 @@ by a trusted backend, never an Evolution instance API key.
 
 **Evolution Go Calls** is a specialized open-source fork of [Evolution Go](https://github.com/evolution-foundation/evolution-go), a high-performance WhatsApp API written in Go and built around [whatsmeow](https://github.com/tulir/whatsmeow).
 
-The purpose of this fork is narrow and deliberate: move WhatsApp calling beyond passive call events and rejection, toward a programmable interface that external systems can answer, control, stream, observe, and secure.
+The purpose of this fork is narrow and deliberate: move WhatsApp calling beyond passive call events and rejection, toward a programmable interface that external systems can answer, stream, observe, and secure.
 
 That makes the project useful for use cases such as:
 
-- AI voice agents
-- speech-to-text / LLM / text-to-speech pipelines
+- external voice/media pipelines
+- speech processing or operator systems implemented outside this repository
 - call recording and observability
 - browser-based operator consoles
 - automated support and contact-center workflows
@@ -71,7 +71,7 @@ The call work associated with this repository extends the model toward:
 1. receiving and tracking active calls;
 2. answering or terminating calls programmatically;
 3. placing experimental outbound calls;
-4. bridging call audio/video to an external WebSocket consumer;
+4. bridging call audio to an external WebSocket consumer;
 5. accepting outbound media from that consumer;
 6. isolating streams by instance and call;
 7. preventing browser clients from receiving the full Evolution instance API key.
@@ -94,8 +94,8 @@ The goal is not to replace Evolution Go. The goal is to develop, test, secure, d
 | Answer / hang up | Implemented in call work | Registry-backed call lifecycle |
 | Real-time call media stream | Implemented in call work | Dedicated WebSocket bridge |
 | Outbound dial | Experimental | Kept explicitly experimental |
-| Outbound audio | Under active validation | Intended for external voice pipelines |
-| Outbound video / video upgrade | Experimental | Known edge cases are documented and isolated |
+| Outbound audio | Experimental | Validate with a paired device before production |
+| Video / participant add | Out of scope | Not exposed by this audio-only branch |
 | Per-call HMAC stream authentication | Implemented in hardened fork work | Short-lived, instance/call-scoped tokens |
 | Legacy API-key stream authentication | Compatibility path | Maintained for compatibility while hardening evolves |
 
@@ -117,7 +117,7 @@ POST /call/dial              # experimental
 GET  /call/stream/:callId    # WebSocket media bridge
 ```
 
-Additional experimental controls have also been explored for reactions, participants, screen sharing, hand raise, and video state/orientation. These are intentionally treated as experimental because real-world WhatsApp call behavior can differ from simple method-level success responses.
+Video, participant-add, and other call-control spikes from upstream PR #1 are intentionally not included in this production target.
 
 ### Why the stream matters
 
@@ -136,8 +136,7 @@ Evolution Go Calls
       ▼
 WebSocket stream
       │
-      ├──> speech-to-text
-      ├──> AI / LLM voice agent
+      ├──> external speech/media pipeline
       ├──> recorder / analytics
       └──> operator application
 
@@ -255,7 +254,7 @@ These checks are part of a broader goal: make call functionality reproducible an
 
 ## AI voice integration
 
-One of the strongest use cases for the call stream is an AI voice pipeline.
+One use case for the call stream is an external voice pipeline.
 
 A typical integration can look like this:
 
@@ -284,7 +283,7 @@ WebSocket outbound audio
 WhatsApp Call
 ```
 
-The repository does **not** force a specific AI provider or voice stack. The intent is to expose a secure transport boundary so downstream applications can choose their own STT, model, TTS, recording, observability, or human-in-the-loop components.
+The repository contains no AI/STT/TTS/LLM logic. It exposes only the secure transport boundary; downstream applications own processing, recording, observability, and operator UX.
 
 ---
 
@@ -296,7 +295,7 @@ This repository is forked from:
 
 Evolution Go is part of the Evolution Foundation ecosystem and provides the core messaging engine, REST API, event system, persistence, queue integrations, media handling, QR pairing, and other infrastructure on which this work is based.
 
-The call implementation originally builds on the work proposed in upstream [evolution-foundation/evolution-go#141](https://github.com/evolution-foundation/evolution-go/pull/141), then adds fork-specific hardening and lifecycle fixes in [luis-kovi/evolution-go-calls#1](https://github.com/luis-kovi/evolution-go-calls/pull/1).
+The call implementation builds on the source-fork work in [luis-kovi/evolution-go-calls#1](https://github.com/luis-kovi/evolution-go-calls/pull/1), then adds fork-specific hardening and lifecycle fixes here.
 
 Where improvements are generally useful and suitable for the upstream project, the preferred direction is to keep them reviewable and upstream-friendly.
 
@@ -562,7 +561,7 @@ Use test accounts and controlled environments when validating experimental call 
 | This fork | [github.com/luis-kovi/evolution-go-calls](https://github.com/luis-kovi/evolution-go-calls) |
 | Hardened call-stream PR | [luis-kovi/evolution-go-calls#1](https://github.com/luis-kovi/evolution-go-calls/pull/1) |
 | Upstream Evolution Go | [github.com/evolution-foundation/evolution-go](https://github.com/evolution-foundation/evolution-go) |
-| Upstream call PR | [evolution-foundation/evolution-go#141](https://github.com/evolution-foundation/evolution-go/pull/141) |
+| Source-fork call PR | [luis-kovi/evolution-go-calls#1](https://github.com/luis-kovi/evolution-go-calls/pull/1) |
 | Evolution documentation | [docs.evolutionfoundation.com.br](https://docs.evolutionfoundation.com.br) |
 | Evolution community | [evolutionfoundation.com.br/community](https://evolutionfoundation.com.br/community) |
 | Changelog | [CHANGELOG.md](./CHANGELOG.md) |

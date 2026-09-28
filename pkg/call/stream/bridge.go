@@ -30,10 +30,9 @@ type bridge struct {
 	writeMu      sync.Mutex
 	incoming     chan []float32
 	closed       chan struct{}
-	ready        chan struct{}
 	closeOnce    sync.Once
-	readyOnce    sync.Once
 	inboundReady atomic.Bool
+	silence      []float32
 }
 
 func newBridge(conn *websocket.Conn) *bridge {
@@ -41,12 +40,11 @@ func newBridge(conn *websocket.Conn) *bridge {
 		conn:     conn,
 		incoming: make(chan []float32, maxQueuedAudioFrames),
 		closed:   make(chan struct{}),
-		ready:    make(chan struct{}),
+		silence:  make([]float32, meowcaller.FrameSamples),
 	}
 }
 
 func (b *bridge) allowInbound() {
-	b.readyOnce.Do(func() { close(b.ready) })
 	b.inboundReady.Store(true)
 }
 
@@ -81,15 +79,18 @@ func (b *bridge) WriteFrame(frame []float32) error {
 	return b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
 }
 
-// ReadFrame implements meowcaller.AudioSource. It does not release a client
-// supplied frame to meowcaller until the call is active.
+// ReadFrame implements meowcaller.AudioSource. It is intentionally
+// non-blocking: meowcaller must keep its relay send loop running with silence
+// until the call is active and whenever the operator has no queued audio.
 func (b *bridge) ReadFrame() ([]float32, error) {
 	select {
-	case <-b.ready:
 	case <-b.closed:
 		return nil, io.EOF
+	default:
 	}
-
+	if !b.inboundReady.Load() {
+		return b.silence, nil
+	}
 	select {
 	case frame, ok := <-b.incoming:
 		if !ok {
@@ -98,6 +99,8 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 		return frame, nil
 	case <-b.closed:
 		return nil, io.EOF
+	default:
+		return b.silence, nil
 	}
 }
 

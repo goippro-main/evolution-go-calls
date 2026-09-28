@@ -1,7 +1,10 @@
 // pkg/call/stream/codec_test.go
 package call_stream
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestPCM16RoundTrip(t *testing.T) {
 	frame := []float32{0, 0.5, -0.5, 1, -1, 0.25}
@@ -38,5 +41,12 @@ func TestPCM16ClampsOutOfRange(t *testing.T) {
 	}
 	if back[1] > -0.99 {
 		t.Errorf("expected clamp to max negative, got %v", back[1])
+	}
+}
+
+func TestPCM16NaNBecomesSilence(t *testing.T) {
+	back := float32FromPCM16(pcm16FromFloat32([]float32{float32(math.NaN())}))
+	if len(back) != 1 || back[0] != 0 {
+		t.Fatalf("expected NaN to encode as silence, got %v", back)
 	}
 }

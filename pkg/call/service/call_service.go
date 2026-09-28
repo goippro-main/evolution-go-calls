@@ -77,11 +77,8 @@ func (c *callService) AnswerCall(data *AnswerCallStruct, instance *instance_mode
 		return nil, fmt.Errorf("%w: no pending call with that id", ErrCallNotFound)
 	}
 
-	// Answer negotiates media for whatever the offer already declared (audio, or
-	// audio+video if the call started as a video call) — no separate step needed.
-	// AcceptVideo is for a different case entirely: accepting a peer's request to
-	// upgrade an in-progress audio call to video (Call.StartVideo on their side),
-	// which isn't wired up here.
+	// Answer negotiates the audio offer. Video upgrades are intentionally outside
+	// this branch's transport contract.
 	if err := call.Answer(); err != nil {
 		logger.LogError("[%s] error answering call: %v", instance.Id, err)
 		return nil, err

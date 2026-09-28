@@ -1,14 +1,18 @@
 package call_stream
 
 import (
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/purpshell/meowcaller"
 )
 
 const testSigningKey = "test-signing-key-with-at-least-32-chars"
@@ -93,6 +97,27 @@ func TestStreamAuthAllowsFiveSecondClockSkew(t *testing.T) {
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("expected five-second clock skew to pass, got status %d", response.Code)
+	}
+}
+
+func TestStreamAuthRejectsTokenTooFarInFuture(t *testing.T) {
+	t.Setenv(streamSigningKeyEnv, testSigningKey)
+	resolver := &fakeStreamInstanceResolver{byID: map[string]*instance_model.Instance{
+		"rekovi": {Id: "rekovi"},
+	}}
+
+	response := runStreamAuthRequest(
+		t,
+		resolver,
+		time.Unix(1_800_000_000, 0),
+		"/call/stream/ABC123?instance=rekovi&exp=1800000401&token=does-not-matter",
+	)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected far-future token to be rejected, got status %d", response.Code)
+	}
+	if resolver.idLookup != "" {
+		t.Fatal("far-future token must be rejected before instance lookup")
 	}
 }
 
@@ -190,7 +215,97 @@ func TestBridgeDropsInboundUntilCallIsActive(t *testing.T) {
 	if err := bridge.WriteFrame(make([]float32, 960)); err != nil {
 		t.Fatalf("expected pre-accept audio to be dropped, got %v", err)
 	}
-	if err := bridge.WriteVideo([]byte{0x00, 0x00, 0x01}); err != nil {
-		t.Fatalf("expected pre-accept video to be dropped, got %v", err)
+}
+
+func TestBridgeDoesNotReleaseOutboundAudioBeforeActive(t *testing.T) {
+	bridge := newBridge(nil)
+	frame, err := bridge.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frame) != meowcaller.FrameSamples {
+		t.Fatalf("pre-active frame has %d samples", len(frame))
+	}
+	for i, sample := range frame {
+		if sample != 0 {
+			t.Fatalf("pre-active sample %d is %v, want silence", i, sample)
+		}
+	}
+
+	bridge.allowInbound()
+	bridge.incoming <- make([]float32, meowcaller.FrameSamples)
+	frame, err = bridge.ReadFrame()
+	if err != nil {
+		t.Fatalf("expected frame after activation, got %v", err)
+	}
+	if len(frame) != meowcaller.FrameSamples {
+		t.Fatalf("active frame has %d samples", len(frame))
+	}
+}
+
+func TestDecodeOutboundAudioRejectsMalformedMessages(t *testing.T) {
+	valid := base64.StdEncoding.EncodeToString(make([]byte, meowcaller.FrameSamples*2))
+	tests := []struct {
+		name string
+		msg  wsMessage
+	}{
+		{name: "empty payload", msg: wsMessage{Event: "media", Track: "outbound"}},
+		{name: "bad base64", msg: wsMessage{Event: "media", Track: "outbound", Payload: "%%%"}},
+		{name: "odd pcm length", msg: wsMessage{Event: "media", Track: "outbound", Payload: base64.StdEncoding.EncodeToString([]byte{1})}},
+		{name: "short frame", msg: wsMessage{Event: "media", Track: "outbound", Payload: base64.StdEncoding.EncodeToString(make([]byte, 10))}},
+		{name: "wrong sample rate", msg: wsMessage{Event: "media", Track: "outbound", SampleRate: 8000, Payload: valid}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeOutboundAudio(tt.msg); err == nil {
+				t.Fatal("expected malformed message to be rejected")
+			}
+		})
+	}
+}
+
+func TestBridgeWritesInboundPCMOverWebSocket(t *testing.T) {
+	serverResult := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverResult <- err
+			return
+		}
+		bridge := newBridge(conn)
+		bridge.allowInbound()
+		frame := make([]float32, meowcaller.FrameSamples)
+		frame[0] = 0.5
+		serverResult <- bridge.WriteFrame(frame)
+		_ = bridge.Close()
+	}))
+	defer server.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var msg wsMessage
+	if err := client.ReadJSON(&msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.Event != "media" || msg.Track != "inbound" {
+		t.Fatalf("unexpected websocket message: %+v", msg)
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != meowcaller.FrameSamples*2 {
+		t.Fatalf("got %d PCM bytes, want %d", len(raw), meowcaller.FrameSamples*2)
+	}
+	decoded := float32FromPCM16(raw)
+	if decoded[0] < 0.49 || decoded[0] > 0.51 {
+		t.Fatalf("unexpected first PCM sample %v", decoded[0])
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatal(err)
 	}
 }

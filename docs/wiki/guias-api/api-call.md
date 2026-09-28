@@ -5,6 +5,8 @@ Documentação do endpoint para gerenciar chamadas WhatsApp.
 ## 📋 Índice
 
 - [Rejeitar Chamada](#rejeitar-chamada)
+- [Atender e transmitir áudio](#atender-e-transmitir-áudio)
+- [Teste E2E ao vivo](#teste-e2e-ao-vivo)
 
 ---
 
@@ -68,6 +70,103 @@ curl -X POST http://localhost:4000/call/reject \
     "callId": "ABC123XYZ"
   }'
 ```
+
+---
+
+## Atender e transmitir áudio
+
+O fluxo de áudio é composto por três passos: capturar o `callId` do evento
+`CallOffer`, atender a chamada e conectar o WebSocket dedicado. O serviço mantém
+o registro por instância; um `callId` de outra instância nunca é aceito.
+
+### Atender
+
+```bash
+curl -X POST http://localhost:4000/call/answer \
+  -H "Content-Type: application/json" \
+  -H "apikey: SUA-CHAVE-API" \
+  -d '{"callCreator":"5511999999999@s.whatsapp.net","callId":"CALL_ID"}'
+```
+
+`404` significa que a oferta expirou, já terminou ou não pertence à instância.
+Um erro de answer não remove o registro, permitindo nova tentativa enquanto a
+chamada ainda estiver disponível.
+
+### WebSocket de mídia
+
+Para navegador ou operador, um backend confiável deve gerar uma URL HMAC curta
+usando `CALL_STREAM_SIGNING_KEY`. A assinatura é o HMAC-SHA256 hexadecimal de:
+
+```text
+<instance>|<callId>|<exp>
+```
+
+Conecte usando:
+
+```text
+ws://localhost:4000/call/stream/CALL_ID?instance=INSTANCE&exp=UNIX_EXP&token=HMAC_HEX
+```
+
+`exp` deve estar dentro de cinco minutos e a tolerância de relógio é de cinco
+segundos. Não entregue a chave API da instância ao navegador. O parâmetro
+`apikey` continua disponível apenas para clientes legados não-browser.
+
+Formato exato, em ambos os sentidos: mono PCM16 little-endian, 16 kHz, 960
+samples por frame (60 ms), codificado em base64 dentro de JSON:
+
+```json
+{"event":"start","callId":"CALL_ID","sampleRate":16000}
+{"event":"media","track":"inbound","payload":"..."}
+{"event":"media","track":"outbound","sampleRate":16000,"payload":"..."}
+{"event":"stop","reason":"hangup"}
+```
+
+`inbound` é áudio real decodificado recebido do interlocutor. `outbound` é
+convertido para `float32` internamente e passado ao playout do meowcaller. Frames
+recebidos antes de a chamada ficar `Active` são descartados; payloads inválidos
+ou com tamanho diferente de `960 * 2` bytes encerram o stream.
+
+### Encerrar
+
+```bash
+curl -X POST http://localhost:4000/call/hangup \
+  -H "Content-Type: application/json" \
+  -H "apikey: SUA-CHAVE-API" \
+  -d '{"callId":"CALL_ID"}'
+```
+
+Fechamento do WebSocket também solicita hangup e remove o registro. Terminação
+remota, disconnect e reconnect da instância limpam as chamadas pendentes.
+
+### Dial outbound
+
+`POST /call/dial` usa `meowcaller.Client.Call` e é experimental. O endpoint
+retorna o `callId`, mas só deve ser considerado validado depois de confirmar no
+dispositivo remoto tanto áudio recebido quanto áudio enviado pelo WebSocket.
+O branch de produção é áudio-only; video e participant-add não fazem parte do
+contrato.
+
+## Teste E2E ao vivo
+
+Requer uma instância pareada e um segundo telefone/conta WhatsApp. O teste
+determinístico local cobre codec, autenticação, isolamento e gating, mas não pode
+provar o relay criptografado do WhatsApp sem esses dispositivos.
+
+1. Inicie o serviço com `CALL_STREAM_SIGNING_KEY` definido e conecte uma instância.
+2. Faça uma chamada de voz do telefone de teste para a instância.
+3. No evento `CallOffer`, salve `callId` e `callCreator`; chame `/call/answer`.
+4. Gere a URL HMAC e conecte o WebSocket antes de falar. Grave os frames
+   `inbound` em WAV 16 kHz mono e confirme voz inteligível, não apenas eventos
+   `start`/`stop`.
+5. Envie pelo menos dez frames `outbound` contendo uma onda PCM conhecida e
+   confirme que o telefone remoto ouve a onda/voz. Depois repita com fala real.
+6. Encerre pelo endpoint e confirme `stop`, fim da chamada nos dois telefones e
+   que uma nova conexão ao mesmo `callId` recebe `404`.
+7. Repita o stream com a credencial de outra instância e confirme `401`/`404`;
+   nunca use a API key da instância no cliente browser.
+
+Qualquer resultado baseado apenas em HTTP `200`, ringing ou conexão WebSocket
+não é aprovação E2E de áudio bidirecional.
 
 ---
 
@@ -139,11 +238,13 @@ Aceitar apenas chamadas de áudio:
 
 ### Limitações do WhatsApp
 
-1. **Não é possível aceitar chamadas via API**: A API do WhatsApp Multi-Device não permite aceitar chamadas programaticamente. Você só pode rejeitá-las.
+1. **Relay experimental**: answer e mídia dependem da compatibilidade da versão
+   pareada com whatsmeow/meowcaller; valide sempre com um telefone real.
 
-2. **Chamadas em grupos**: Chamadas em grupos também disparam o evento, mas o campo `isGroup` será `true`.
+2. **Chamadas em grupos e vídeo**: não fazem parte do contrato audio-only deste
+   branch.
 
-3. **Timing**: A rejeição deve ser feita rapidamente. Se demorar muito, a chamada pode cair antes da rejeição.
+3. **Timing**: uma oferta pode expirar antes de `/call/answer` ser processado.
 
 ### Boas Práticas
 

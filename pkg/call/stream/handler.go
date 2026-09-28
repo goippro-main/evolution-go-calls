@@ -127,17 +127,23 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 			callService.ForgetActiveCall(instance.Id, callID, call)
 		}()
 
-		if callService.IsOutgoingCall(instance.Id, callID) {
-			call.OnPeerAccept(b.allowInbound)
-		} else {
-			call.OnStateChange(func(phase meowcaller.CallPhase) {
-				if phase == meowcaller.CallPhaseActive {
-					b.allowInbound()
-				}
-			})
-			if call.State() == meowcaller.CallPhaseActive {
+		call.OnStateChange(func(phase meowcaller.CallPhase) {
+			if phase == meowcaller.CallPhaseActive {
 				b.allowInbound()
 			}
+			if phase == meowcaller.CallPhaseEnded {
+				_ = b.Close()
+			}
+		})
+		if callService.IsOutgoingCall(instance.Id, callID) {
+			// Outbound media is allowed as soon as the peer accepts. This can
+			// precede CallPhaseActive, which waits for the first RTP exchange.
+			call.OnPeerAccept(b.allowInbound)
+		} else if call.State() == meowcaller.CallPhaseActive {
+			b.allowInbound()
+		}
+		if call.State() == meowcaller.CallPhaseEnded {
+			return
 		}
 
 		call.OnEnd(func(reason string) { _ = b.Close() })
