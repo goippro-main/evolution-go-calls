@@ -36,17 +36,21 @@ const (
 
 type cfg struct {
 	api, instance, key, signing, listen, webhook, out, wav string
+	mode, number                                           string
 	duration, delay, timeout                               time.Duration
 	configure                                              bool
 }
 
 type wsMessage struct {
-	Event      string `json:"event"`
-	CallID     string `json:"callId,omitempty"`
-	SampleRate int    `json:"sampleRate,omitempty"`
-	Track      string `json:"track,omitempty"`
-	Payload    string `json:"payload,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Event      string         `json:"event"`
+	CallID     string         `json:"callId,omitempty"`
+	SampleRate int            `json:"sampleRate,omitempty"`
+	Track      string         `json:"track,omitempty"`
+	Payload    string         `json:"payload,omitempty"`
+	Reason     string         `json:"reason,omitempty"`
+	Phase      string         `json:"phase,omitempty"`
+	Direction  string         `json:"direction,omitempty"`
+	Stats      map[string]any `json:"stats,omitempty"`
 }
 
 type offer struct {
@@ -78,6 +82,8 @@ func main() {
 	flag.StringVar(&c.webhook, "webhook-url", os.Getenv("E2E_WEBHOOK_URL"), "webhook URL reachable by Evolution")
 	flag.StringVar(&c.out, "out-dir", env("E2E_OUT_DIR", "/tmp/evolution-go-call-e2e"), "artifact directory")
 	flag.StringVar(&c.wav, "outbound-wav", "", "optional 16 kHz mono PCM16 WAV; default is marker tone")
+	flag.StringVar(&c.mode, "mode", "inbound", "call direction: inbound or outbound")
+	flag.StringVar(&c.number, "number", "", "ordinary WhatsApp number for outbound call")
 	flag.DurationVar(&c.duration, "duration", 8*time.Second, "stream duration")
 	flag.DurationVar(&c.delay, "inject-delay", 750*time.Millisecond, "delay before marker injection")
 	flag.DurationVar(&c.timeout, "http-timeout", 10*time.Second, "HTTP timeout")
@@ -85,6 +91,12 @@ func main() {
 	flag.Parse()
 	if c.instance == "" || c.key == "" {
 		log.Fatal("set -instance/EVOLUTION_INSTANCE and -apikey/EVOLUTION_INSTANCE_API_KEY")
+	}
+	if c.mode != "inbound" && c.mode != "outbound" {
+		log.Fatal("-mode must be inbound or outbound")
+	}
+	if c.mode == "outbound" && strings.TrimSpace(c.number) == "" {
+		log.Fatal("-number is required in outbound mode")
 	}
 	if c.webhook == "" {
 		c.webhook = "http://" + c.listen + "/webhook"
@@ -98,7 +110,7 @@ func main() {
 	}
 	defer logFile.Close()
 	l := &logger{enc: json.NewEncoder(logFile)}
-	l.write("harness_started", map[string]any{"api": c.api, "instance": c.instance, "webhook": c.webhook, "streamAuth": authMode(c.signing), "outDir": c.out})
+	l.write("harness_started", map[string]any{"api": c.api, "instance": c.instance, "mode": c.mode, "webhook": c.webhook, "streamAuth": authMode(c.signing), "outDir": c.out})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -125,35 +137,60 @@ func main() {
 		}
 		l.write("configure_succeeded", nil)
 	}
-	log.Printf("waiting for CallOffer; webhook=%s", c.webhook)
-	var incoming offer
-	select {
-	case <-ctx.Done():
-		l.write("harness_cancelled", nil)
-		return
-	case incoming = <-offers:
-	}
-	if incoming.ID == "" || incoming.Creator == "" {
-		log.Fatal("CallOffer did not contain call id and creator")
-	}
-	l.write("call_offer_observed", map[string]any{"callId": incoming.ID, "callCreator": incoming.Creator})
-	if err := post(client, c.api+"/call/answer", c.key, map[string]string{"callId": incoming.ID, "callCreator": incoming.Creator}); err != nil {
-		l.write("answer_failed", map[string]any{"callId": incoming.ID, "error": err.Error()})
+	callID, err := prepareCall(ctx, client, c, offers, l)
+	if err != nil {
 		log.Fatal(err)
 	}
-	l.write("answer_succeeded", map[string]any{"callId": incoming.ID})
-	hangupDone, streamErr := stream(client, ctx, c, incoming.ID, l)
+	hangupDone, streamErr := stream(client, ctx, c, callID, l)
 	if streamErr != nil {
-		l.write("stream_failed", map[string]any{"callId": incoming.ID, "error": streamErr.Error()})
+		l.write("stream_failed", map[string]any{"callId": callID, "error": streamErr.Error()})
 		log.Printf("stream: %v", streamErr)
 	}
 	if !hangupDone {
-		if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": incoming.ID}); err != nil {
-			l.write("hangup_failed", map[string]any{"callId": incoming.ID, "error": err.Error()})
+		if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": callID}); err != nil {
+			l.write("hangup_failed", map[string]any{"callId": callID, "error": err.Error()})
 			log.Printf("hangup: %v", err)
 		} else {
-			l.write("hangup_succeeded", map[string]any{"callId": incoming.ID})
+			l.write("hangup_succeeded", map[string]any{"callId": callID})
 		}
+	}
+	if streamErr != nil {
+		log.Fatal(streamErr)
+	}
+}
+
+func prepareCall(ctx context.Context, client *http.Client, c cfg, offers <-chan offer, l *logger) (string, error) {
+	if c.mode == "outbound" {
+		var response struct {
+			CallID string `json:"callId"`
+		}
+		if err := postJSON(client, c.api+"/call/dial", c.key, map[string]string{"number": c.number}, &response); err != nil {
+			l.write("dial_failed", map[string]any{"error": err.Error()})
+			return "", err
+		}
+		if response.CallID == "" {
+			return "", errors.New("/call/dial returned no callId")
+		}
+		l.write("dial_succeeded", map[string]any{"callId": response.CallID, "number": c.number})
+		return response.CallID, nil
+	}
+
+	log.Printf("waiting for CallOffer; webhook=%s", c.webhook)
+	select {
+	case <-ctx.Done():
+		l.write("harness_cancelled", nil)
+		return "", ctx.Err()
+	case incoming := <-offers:
+		if incoming.ID == "" || incoming.Creator == "" {
+			return "", errors.New("CallOffer did not contain call id and creator")
+		}
+		l.write("call_offer_observed", map[string]any{"callId": incoming.ID, "callCreator": incoming.Creator})
+		if err := post(client, c.api+"/call/answer", c.key, map[string]string{"callId": incoming.ID, "callCreator": incoming.Creator}); err != nil {
+			l.write("answer_failed", map[string]any{"callId": incoming.ID, "error": err.Error()})
+			return "", err
+		}
+		l.write("answer_succeeded", map[string]any{"callId": incoming.ID})
+		return incoming.ID, nil
 	}
 }
 
@@ -243,6 +280,10 @@ func find(value any, wanted string) (string, bool) {
 }
 
 func post(client *http.Client, endpoint, key string, body any) error {
+	return postJSON(client, endpoint, key, body, nil)
+}
+
+func postJSON(client *http.Client, endpoint, key string, body any, result any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -264,6 +305,11 @@ func post(client *http.Client, endpoint, key string, body any) error {
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("%s: %s: %s", endpoint, response.Status, strings.TrimSpace(string(bodyBytes)))
+	}
+	if result != nil && len(bodyBytes) > 0 {
+		if err := json.Unmarshal(bodyBytes, result); err != nil {
+			return fmt.Errorf("%s: invalid JSON response: %w", endpoint, err)
+		}
 	}
 	return nil
 }
@@ -303,10 +349,29 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go inject(streamCtx, write, source, c.delay, l)
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	markReady := func(reason string) {
+		readyOnce.Do(func() {
+			l.write("media_ready", map[string]any{"callId": callID, "reason": reason})
+			close(ready)
+		})
+	}
+	go inject(streamCtx, ready, write, source, c.delay, l)
 
 	deadline := time.NewTimer(c.duration)
 	defer deadline.Stop()
+	var hangupDone bool
+	var serverStats map[string]any
+	var closeDeadline *time.Timer
+	finish := func() (bool, error) {
+		if err := validateMedia(c.mode, rec.summary(), serverStats); err != nil {
+			l.write("media_validation_fail", map[string]any{"callId": callID, "mode": c.mode, "error": err.Error(), "server": serverStats})
+			return hangupDone, err
+		}
+		l.write("media_validation_pass", map[string]any{"callId": callID, "mode": c.mode, "server": serverStats})
+		return hangupDone, nil
+	}
 	for {
 		select {
 		case <-streamCtx.Done():
@@ -316,9 +381,17 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 			if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": callID}); err != nil {
 				return false, fmt.Errorf("hangup at stream deadline: %w", err)
 			}
+			hangupDone = true
 			l.write("hangup_succeeded", map[string]any{"callId": callID})
-			return true, nil
+			closeDeadline = time.NewTimer(2 * time.Second)
 		default:
+		}
+		if closeDeadline != nil {
+			select {
+			case <-closeDeadline.C:
+				return finish()
+			default:
+			}
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		var message wsMessage
@@ -327,13 +400,23 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 				continue
 			}
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return true, nil
+				return finish()
 			}
 			return false, err
 		}
 		switch message.Event {
 		case "start":
 			l.write("ws_start", map[string]any{"callId": message.CallID, "sampleRate": message.SampleRate})
+		case "state":
+			l.write("call_state", map[string]any{"callId": callID, "phase": message.Phase, "direction": message.Direction})
+			if message.Phase == "active" && c.mode == "inbound" {
+				markReady("active")
+			}
+		case "peer_accept":
+			l.write("peer_accept", map[string]any{"callId": callID, "direction": message.Direction})
+			if c.mode == "outbound" {
+				markReady("peer_accept")
+			}
 		case "media":
 			if message.Track != "inbound" {
 				continue
@@ -347,27 +430,52 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 			}
 			summary := rec.summary()
 			l.write("inbound_frame", map[string]any{"callId": callID, "frameTs": time.Now().UTC().Format(time.RFC3339Nano), "frame": summary["inboundFrames"], "nonZeroFrames": summary["nonZeroFrames"], "silentFrames": summary["silentFrames"]})
+		case "diagnostics":
+			serverStats = message.Stats
+			l.write("server_diagnostics", map[string]any{"callId": callID, "stats": serverStats})
 		case "stop":
 			l.write("ws_stop", map[string]any{"callId": callID, "reason": message.Reason})
-			return true, nil
+			return finish()
 		}
 	}
 }
 
-func inject(ctx context.Context, write func(wsMessage) error, source []int16, delay time.Duration, l *logger) {
+func inject(ctx context.Context, ready <-chan struct{}, write func(wsMessage) error, source []int16, delay time.Duration, l *logger) {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+	case <-ready:
 	case <-ctx.Done():
 		return
 	}
-	var frames int64
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		return
+	}
+	var frames, nonZeroFrames, nonZeroSamples, peak int64
 	start := time.Now().UTC()
 	for offset := 0; ; offset += frameSamples {
 		payload := make([]byte, frameBytes)
+		nonZero := false
 		for index := 0; index < frameSamples; index++ {
-			binary.LittleEndian.PutUint16(payload[index*2:], uint16(source[(offset+index)%len(source)]))
+			sample := source[(offset+index)%len(source)]
+			if sample > 8 || sample < -8 {
+				nonZero = true
+				nonZeroSamples++
+			}
+			abs := int64(sample)
+			if abs < 0 {
+				abs = -abs
+			}
+			if abs > peak {
+				peak = abs
+			}
+			binary.LittleEndian.PutUint16(payload[index*2:], uint16(sample))
+		}
+		if nonZero {
+			nonZeroFrames++
 		}
 		if err := write(wsMessage{Event: "media", Track: "outbound", SampleRate: rate, Payload: base64.StdEncoding.EncodeToString(payload)}); err != nil {
 			return
@@ -376,9 +484,35 @@ func inject(ctx context.Context, write func(wsMessage) error, source []int16, de
 		select {
 		case <-time.After(60 * time.Millisecond):
 		case <-ctx.Done():
-			l.write("outbound_summary", map[string]any{"frames": frames, "firstFrameTs": start, "lastFrameTs": time.Now().UTC()})
+			l.write("outbound_summary", map[string]any{"frames": frames, "nonZeroFrames": nonZeroFrames, "nonZeroSamples": nonZeroSamples, "peak": peak, "firstFrameTs": start, "lastFrameTs": time.Now().UTC()})
 			return
 		}
+	}
+}
+
+func validateMedia(mode string, inbound, server map[string]any) error {
+	if positiveCounter(inbound, "inboundFrames") == 0 || positiveCounter(inbound, "nonZeroFrames") == 0 {
+		return fmt.Errorf("%s media failed: recorder has no non-zero inbound audio (frames=%d nonZeroFrames=%d)", mode, positiveCounter(inbound, "inboundFrames"), positiveCounter(inbound, "nonZeroFrames"))
+	}
+	if server == nil {
+		return errors.New("media failed: server diagnostics were not received")
+	}
+	if positiveCounter(server, "outboundFrames") == 0 || positiveCounter(server, "outboundNonZeroFrames") == 0 {
+		return fmt.Errorf("%s media failed: bridge injected no non-zero outbound audio (frames=%d nonZeroFrames=%d)", mode, positiveCounter(server, "outboundFrames"), positiveCounter(server, "outboundNonZeroFrames"))
+	}
+	return nil
+}
+
+func positiveCounter(values map[string]any, key string) int64 {
+	switch value := values[key].(type) {
+	case int64:
+		return value
+	case float64:
+		return int64(value)
+	case int:
+		return int64(value)
+	default:
+		return 0
 	}
 }
 

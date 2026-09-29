@@ -2,11 +2,105 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestValidateMediaRejectsSilence(t *testing.T) {
+	err := validateMedia("inbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(0)}, map[string]any{
+		"outboundFrames": int64(3), "outboundNonZeroFrames": int64(3),
+	})
+	if err == nil {
+		t.Fatal("expected silent inbound audio to fail")
+	}
+}
+
+func TestValidateMediaRequiresServerOutboundEvidence(t *testing.T) {
+	err := validateMedia("outbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(2)}, map[string]any{
+		"outboundFrames": int64(0), "outboundNonZeroFrames": int64(0),
+	})
+	if err == nil {
+		t.Fatal("expected missing outbound bridge media to fail")
+	}
+}
+
+func TestValidateMediaPassesOnlyWithBothTracks(t *testing.T) {
+	err := validateMedia("outbound", map[string]any{"inboundFrames": float64(3), "nonZeroFrames": float64(2)}, map[string]any{
+		"outboundFrames": float64(3), "outboundNonZeroFrames": float64(3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebhookFindsNestedCallOffer(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(`{"data":{"event":"CallOffer","callId":"abc","callCreator":"123@s.whatsapp.net"}}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := first(payload, "CallID", "callId"); got != "abc" {
+		t.Fatalf("call id = %q", got)
+	}
+	if got := first(payload, "CallCreator", "callCreator"); got != "123@s.whatsapp.net" {
+		t.Fatalf("call creator = %q", got)
+	}
+}
+
+func TestPostJSONDecodesDialResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("apikey") != "secret" {
+			t.Fatalf("missing apikey")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"callId":"CALL-1"}`))
+	}))
+	defer server.Close()
+	var response struct {
+		CallID string `json:"callId"`
+	}
+	if err := postJSON(server.Client(), server.URL, "secret", map[string]string{"number": "351900000000"}, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.CallID != "CALL-1" {
+		t.Fatalf("call id = %q", response.CallID)
+	}
+}
+
+func TestRecorderWritesValidWAVHeader(t *testing.T) {
+	path := t.TempDir() + "/audio.wav"
+	recorder, err := newRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, frameBytes)
+	frame[0] = 1
+	if err := recorder.add(frame); err != nil {
+		t.Fatal(err)
+	}
+	recorder.close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(44+frameBytes) {
+		t.Fatalf("WAV size = %d", info.Size())
+	}
+}
+
+func TestPositiveCounterSupportsJSONNumbers(t *testing.T) {
+	if got := positiveCounter(map[string]any{"n": float64(4)}, "n"); got != 4 {
+		t.Fatalf("counter = %d", got)
+	}
+	if got := positiveCounter(map[string]any{"n": time.Duration(4)}, "n"); got != 0 {
+		t.Fatalf("unexpected duration conversion = %d", got)
+	}
+}
 
 func TestMarkerToneIsIdentifiableAndFrameAligned(t *testing.T) {
 	samples, name, err := outbound("")

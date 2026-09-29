@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/purpshell/meowcaller"
@@ -23,16 +24,33 @@ type wsMessage struct {
 	Track      string `json:"track,omitempty"`
 	Payload    string `json:"payload,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+	Direction  string `json:"direction,omitempty"`
+	Stats      any    `json:"stats,omitempty"`
 }
 
 type bridge struct {
-	conn         *websocket.Conn
-	writeMu      sync.Mutex
-	incoming     chan []float32
-	closed       chan struct{}
-	closeOnce    sync.Once
-	inboundReady atomic.Bool
-	silence      []float32
+	conn                   *websocket.Conn
+	writeMu                sync.Mutex
+	incoming               chan []float32
+	closed                 chan struct{}
+	closeOnce              sync.Once
+	inboundReady           atomic.Bool
+	silence                []float32
+	inboundFrames          atomic.Int64
+	inboundNonZeroFrames   atomic.Int64
+	inboundNonZeroSamples  atomic.Int64
+	inboundPeak            atomic.Int64
+	outboundQueuedFrames   atomic.Int64
+	outboundFrames         atomic.Int64
+	outboundNonZeroFrames  atomic.Int64
+	outboundNonZeroSamples atomic.Int64
+	outboundPeak           atomic.Int64
+	droppedOutboundFrames  atomic.Int64
+	firstInboundUnixNano   atomic.Int64
+	lastInboundUnixNano    atomic.Int64
+	firstOutboundUnixNano  atomic.Int64
+	lastOutboundUnixNano   atomic.Int64
 }
 
 func newBridge(conn *websocket.Conn) *bridge {
@@ -65,6 +83,86 @@ func (b *bridge) writeStart(callID string) error {
 	})
 }
 
+func (b *bridge) writeState(callID, phase, direction string) error {
+	return b.writeJSON(wsMessage{Event: "state", CallID: callID, Phase: phase, Direction: direction})
+}
+
+func (b *bridge) diagnostics() map[string]any {
+	return map[string]any{
+		"inboundFrames":          b.inboundFrames.Load(),
+		"inboundNonZeroFrames":   b.inboundNonZeroFrames.Load(),
+		"inboundNonZeroSamples":  b.inboundNonZeroSamples.Load(),
+		"inboundPeak":            b.inboundPeak.Load(),
+		"outboundQueuedFrames":   b.outboundQueuedFrames.Load(),
+		"outboundFrames":         b.outboundFrames.Load(),
+		"outboundNonZeroFrames":  b.outboundNonZeroFrames.Load(),
+		"outboundNonZeroSamples": b.outboundNonZeroSamples.Load(),
+		"outboundPeak":           b.outboundPeak.Load(),
+		"droppedOutboundFrames":  b.droppedOutboundFrames.Load(),
+		"firstInboundTs":         unixNanoTime(b.firstInboundUnixNano.Load()),
+		"lastInboundTs":          unixNanoTime(b.lastInboundUnixNano.Load()),
+		"firstOutboundTs":        unixNanoTime(b.firstOutboundUnixNano.Load()),
+		"lastOutboundTs":         unixNanoTime(b.lastOutboundUnixNano.Load()),
+		"bidirectionalMedia":     b.inboundNonZeroFrames.Load() > 0 && b.outboundNonZeroFrames.Load() > 0,
+	}
+}
+
+func unixNanoTime(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return time.Unix(0, value).UTC()
+}
+
+func (b *bridge) recordInbound(frame []float32) {
+	nonZeroFrames, nonZeroSamples, peak := frameStats(frame)
+	b.inboundFrames.Add(1)
+	b.inboundNonZeroFrames.Add(nonZeroFrames)
+	b.inboundNonZeroSamples.Add(nonZeroSamples)
+	maxAtomic(&b.inboundPeak, peak)
+	now := time.Now().UTC().UnixNano()
+	b.firstInboundUnixNano.CompareAndSwap(0, now)
+	b.lastInboundUnixNano.Store(now)
+}
+
+func (b *bridge) recordOutbound(frame []float32) {
+	nonZeroFrames, nonZeroSamples, peak := frameStats(frame)
+	b.outboundFrames.Add(1)
+	b.outboundNonZeroFrames.Add(nonZeroFrames)
+	b.outboundNonZeroSamples.Add(nonZeroSamples)
+	maxAtomic(&b.outboundPeak, peak)
+	now := time.Now().UTC().UnixNano()
+	b.firstOutboundUnixNano.CompareAndSwap(0, now)
+	b.lastOutboundUnixNano.Store(now)
+}
+
+func maxAtomic(target *atomic.Int64, value int64) {
+	for current := target.Load(); value > current; current = target.Load() {
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func frameStats(frame []float32) (nonZeroFrames, nonZeroSamples, peak int64) {
+	for _, sample := range frame {
+		if sample < 0 {
+			sample = -sample
+		}
+		if sample > 0.00025 {
+			nonZeroSamples++
+		}
+		scaled := int64(sample * 32767)
+		if scaled > peak {
+			peak = scaled
+		}
+	}
+	if nonZeroSamples > 0 {
+		nonZeroFrames = 1
+	}
+	return nonZeroFrames, nonZeroSamples, peak
+}
+
 // WriteFrame implements meowcaller.AudioSink. Frames received before the call
 // becomes active are deliberately discarded; they must never be exposed as live
 // media to an operator client.
@@ -76,7 +174,11 @@ func (b *bridge) WriteFrame(frame []float32) error {
 		return fmt.Errorf("call stream: inbound frame has %d samples, want %d", len(frame), meowcaller.FrameSamples)
 	}
 	payload := base64.StdEncoding.EncodeToString(pcm16FromFloat32(frame))
-	return b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload})
+	if err := b.writeJSON(wsMessage{Event: "media", Track: "inbound", Payload: payload}); err != nil {
+		return err
+	}
+	b.recordInbound(frame)
+	return nil
 }
 
 // ReadFrame implements meowcaller.AudioSource. It is intentionally
@@ -96,6 +198,7 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 		if !ok {
 			return nil, io.EOF
 		}
+		b.recordOutbound(frame)
 		return frame, nil
 	case <-b.closed:
 		return nil, io.EOF
@@ -109,6 +212,7 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 func (b *bridge) Close() error {
 	b.closeOnce.Do(func() {
 		if b.conn != nil {
+			_ = b.writeJSON(wsMessage{Event: "diagnostics", Stats: b.diagnostics()})
 			_ = b.writeJSON(wsMessage{Event: "stop", Reason: "hangup"})
 		}
 		close(b.closed)
@@ -165,9 +269,11 @@ func (b *bridge) readLoop() error {
 		}
 		select {
 		case b.incoming <- frame:
+			b.outboundQueuedFrames.Add(1)
 		case <-b.closed:
 			return io.EOF
 		default:
+			b.droppedOutboundFrames.Add(1)
 			// Drop newest input under backpressure instead of blocking the websocket
 			// reader and starving call teardown/control messages.
 		}

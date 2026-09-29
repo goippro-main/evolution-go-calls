@@ -119,6 +119,7 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 		}
 
 		b := newBridge(conn)
+		outgoing := callService.IsOutgoingCall(instance.Id, callID)
 		defer func() {
 			_ = b.Close()
 			if call.State() != meowcaller.CallPhaseEnded {
@@ -131,14 +132,18 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 			if phase == meowcaller.CallPhaseActive {
 				b.allowInbound()
 			}
+			_ = b.writeState(callID, callPhaseName(phase), callDirectionName(outgoing))
 			if phase == meowcaller.CallPhaseEnded {
 				_ = b.Close()
 			}
 		})
-		if callService.IsOutgoingCall(instance.Id, callID) {
+		if outgoing {
 			// Outbound media is allowed as soon as the peer accepts. This can
 			// precede CallPhaseActive, which waits for the first RTP exchange.
-			call.OnPeerAccept(b.allowInbound)
+			call.OnPeerAccept(func() {
+				b.allowInbound()
+				_ = b.writeJSON(wsMessage{Event: "peer_accept", CallID: callID, Direction: "outgoing"})
+			})
 		} else if call.State() == meowcaller.CallPhaseActive {
 			b.allowInbound()
 		}
@@ -149,9 +154,36 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 		call.OnEnd(func(reason string) { _ = b.Close() })
 		call.Receive(b)
 		call.Play(b)
+		_ = b.writeState(callID, callPhaseName(call.State()), callDirectionName(outgoing))
 		if err := b.writeStart(callID); err != nil {
 			return
 		}
 		_ = b.readLoop()
+	}
+}
+
+func callDirectionName(outgoing bool) string {
+	if outgoing {
+		return "outgoing"
+	}
+	return "incoming"
+}
+
+func callPhaseName(phase meowcaller.CallPhase) string {
+	switch phase {
+	case meowcaller.CallPhaseIdle:
+		return "idle"
+	case meowcaller.CallPhaseCalling:
+		return "calling"
+	case meowcaller.CallPhaseRinging:
+		return "ringing"
+	case meowcaller.CallPhaseConnecting:
+		return "connecting"
+	case meowcaller.CallPhaseActive:
+		return "active"
+	case meowcaller.CallPhaseEnded:
+		return "ended"
+	default:
+		return "unknown"
 	}
 }

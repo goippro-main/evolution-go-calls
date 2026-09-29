@@ -243,6 +243,38 @@ func TestBridgeDoesNotReleaseOutboundAudioBeforeActive(t *testing.T) {
 	}
 }
 
+func TestBridgeDiagnosticsRequireBidirectionalNonZeroFrames(t *testing.T) {
+	bridge := newBridge(nil)
+	bridge.allowInbound()
+	inbound := make([]float32, meowcaller.FrameSamples)
+	inbound[0] = 0.5
+	outbound := make([]float32, meowcaller.FrameSamples)
+	outbound[1] = -0.25
+	bridge.recordInbound(inbound)
+	bridge.incoming <- outbound
+	if _, err := bridge.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := bridge.diagnostics()
+	if stats["inboundFrames"] != int64(1) || stats["inboundNonZeroFrames"] != int64(1) {
+		t.Fatalf("unexpected inbound diagnostics: %+v", stats)
+	}
+	if stats["outboundFrames"] != int64(1) || stats["outboundNonZeroFrames"] != int64(1) {
+		t.Fatalf("unexpected outbound diagnostics: %+v", stats)
+	}
+	if stats["bidirectionalMedia"] != true {
+		t.Fatalf("expected bidirectional media evidence: %+v", stats)
+	}
+}
+
+func TestFrameStatsTreatsSilenceAsZero(t *testing.T) {
+	nonZeroFrames, nonZeroSamples, peak := frameStats(make([]float32, meowcaller.FrameSamples))
+	if nonZeroFrames != 0 || nonZeroSamples != 0 || peak != 0 {
+		t.Fatalf("silence stats = %d/%d/%d", nonZeroFrames, nonZeroSamples, peak)
+	}
+}
+
 func TestDecodeOutboundAudioRejectsMalformedMessages(t *testing.T) {
 	valid := base64.StdEncoding.EncodeToString(make([]byte, meowcaller.FrameSamples*2))
 	tests := []struct {

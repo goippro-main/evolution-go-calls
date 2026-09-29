@@ -75,22 +75,51 @@ Pairing-code flow:
     go run ./tools/whatsapp-call-e2e \
       -webhook-url http://127.0.0.1:8090/webhook
 
+Для исходящего направления, после pairing:
+
+    EVOLUTION_API_URL="$API" \
+    EVOLUTION_INSTANCE="wa-call-e2e" \
+    EVOLUTION_INSTANCE_API_KEY="$INSTANCE_TOKEN" \
+    CALL_STREAM_SIGNING_KEY="$CALL_STREAM_SIGNING_KEY" \
+    go run ./tools/whatsapp-call-e2e \
+      -mode outbound -number "<обычный WhatsApp номер>" \
+      -webhook-url http://127.0.0.1:8090/webhook
+
 Если Evolution в контейнере, используйте, например,
 -webhook-url http://host.docker.internal:8090/webhook и
 -webhook-listen 0.0.0.0:8090.
 
 ## Единственное действие человека для live E2E
 
-После подготовки уже спаренного dedicated test number позвонить с отдельного
-согласованного WhatsApp номера. Harness ответит, запишет inbound track,
-отправит marker и сделает hangup. Если pairing ещё не выполнен, отдельное
-действие человека — сканировать QR или ввести pairing code; без явного
-подтверждения владельца аккаунта это не выполняется.
+После подготовки уже спаренного dedicated test number для inbound нужно
+позвонить на него с отдельного согласованного WhatsApp номера. Для outbound
+harness сам инициирует звонок на номер из `-number`; человек принимает его на
+обычном WhatsApp телефоне. Harness ответит/дождётся acceptance, запишет
+inbound track, отправит marker и сделает hangup. Если pairing ещё не выполнен,
+отдельное действие человека — сканировать QR или ввести pairing code; без
+явного подтверждения владельца аккаунта это не выполняется.
 
-Успех нельзя объявлять по HTTP 200, ringing или ws_start. Нужны
-положительные inbound frames, nonZeroFrames > 0, прослушиваемый WAV и
-подтверждение, что удалённый телефон слышит marker 440/880/660 Hz. Нулевые
-или только silent frames — отсутствие подтверждённого аудио.
+Успех нельзя объявлять по HTTP 200, ringing, connected state, keepalive или
+ws_start. Нужны положительные inbound frames, nonZeroFrames > 0, WAV с
+ненулевым аудио, server diagnostics с outboundFrames > 0 и
+outboundNonZeroFrames > 0, а также подтверждение, что удалённый телефон
+слышит marker 440/880/660 Hz. Нулевые или только silent frames — отсутствие
+подтверждённого аудио. При отсутствии любого счётчика harness завершается с
+ошибкой и пишет `media_validation_fail` через `stream_failed`.
+
+## Граница live-проверки
+
+До появления одного paired WhatsApp аккаунта и одного обычного номера можно
+проверить сборку, pairing readiness, webhook parsing, signed stream auth,
+WAV recorder/injection, bridge counters, inbound/outbound call scripts и все
+детерминированные тесты. Нельзя честно подтвердить до этого момента:
+
+- inbound: что реальный caller audio дошёл от WhatsApp до bridge;
+- outbound: что реальный remote audio дошёл от WhatsApp до bridge;
+- в обоих направлениях: что marker был услышан удалённым телефоном.
+
+Group calls, multi-participant recording, Claude/Moshi, UI, video и любые
+другие каналы сознательно не входят в этот контракт.
 
 ## Два участника и отдельные tracks
 
