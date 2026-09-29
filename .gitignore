@@ -3,6 +3,7 @@ logs/*
 build/
 *.prof
 coverage.*
+e2e-artifacts/
 .air.toml
 .idea/
 .vscode/
