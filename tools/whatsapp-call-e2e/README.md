@@ -1,11 +1,12 @@
 # Real WhatsApp call E2E harness
 
-This tool validates one real 1:1 WhatsApp audio call. In `inbound` mode it
-waits for a real CallOffer, answers it, connects to `/call/stream/:callId`,
-records inbound PCM16LE to a WAV file, sends a deterministic 440/880/660 Hz
-marker, and hangs up. In `outbound` mode it calls one ordinary WhatsApp
-number through `/call/dial`, waits for peer acceptance, runs the same bridge,
-and hangs up.
+This tool validates real 1:1 WhatsApp audio calls. In `inbound` mode it
+keeps the webhook listener alive until interrupted, answers each real CallOffer,
+connects to `/call/stream/:callId`, records inbound PCM16LE to a WAV file,
+sends a deterministic 440/880/660 Hz marker, and hangs up. Use `-max-calls N`
+when a finite inbound run is needed. In `outbound` mode it calls one ordinary
+WhatsApp number through `/call/dial`, waits for peer acceptance, runs the same
+bridge, and hangs up.
 
 It never creates or pairs an instance. Pairing remains an explicit operator
 action with a dedicated test account.
@@ -26,8 +27,8 @@ listen address must accept that connection. API and signing keys are never
 written to lifecycle logs.
 
 The service must already be running and the instance must already be paired.
-The harness configures `subscribe: ["CALL"]`, selects the first incoming
-CallOffer in inbound mode, and uses HMAC stream auth when `-signing-key` is set.
+The harness configures `subscribe: ["CALL"]`, processes incoming CallOffer
+events in inbound mode, and uses HMAC stream auth when `-signing-key` is set.
 Without it, the legacy query apikey stream auth is used.
 
 Outbound example:

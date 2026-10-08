@@ -36,6 +36,7 @@ type bridge struct {
 	closed                 chan struct{}
 	closeOnce              sync.Once
 	inboundReady           atomic.Bool
+	outboundReady          atomic.Bool
 	silence                []float32
 	inboundFrames          atomic.Int64
 	inboundNonZeroFrames   atomic.Int64
@@ -64,6 +65,10 @@ func newBridge(conn *websocket.Conn) *bridge {
 
 func (b *bridge) allowInbound() {
 	b.inboundReady.Store(true)
+}
+
+func (b *bridge) allowOutbound() {
+	b.outboundReady.Store(true)
 }
 
 func (b *bridge) writeJSON(msg wsMessage) error {
@@ -190,7 +195,7 @@ func (b *bridge) ReadFrame() ([]float32, error) {
 		return nil, io.EOF
 	default:
 	}
-	if !b.inboundReady.Load() {
+	if !b.outboundReady.Load() {
 		return b.silence, nil
 	}
 	select {
@@ -264,7 +269,7 @@ func (b *bridge) readLoop() error {
 			b.Close()
 			return err
 		}
-		if !b.inboundReady.Load() {
+		if !b.outboundReady.Load() {
 			continue
 		}
 		select {

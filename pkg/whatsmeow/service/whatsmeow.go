@@ -434,7 +434,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// meowcaller.NewClient must run before client.Connect() — it installs the raw
 	// <call> stanza adapter, and doing so after Connect() is a documented race.
-	meowcallerClient := meowcaller.NewClient(client)
+	meowcallerClient := meowcaller.NewClient(client, meowcaller.WithLogger(newMeowcallerLogger(
+		w.loggerWrapper.GetLogger(cd.Instance.Id),
+		cd.Instance.Id,
+	)))
 	if w.meowcallerMu != nil {
 		w.meowcallerMu.Lock()
 		w.meowcallerPointer[cd.Instance.Id] = meowcallerClient
@@ -1985,6 +1988,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "CallRelayLatency"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call relay latency %+v", mycli.userID, evt)
+	case *events.CallTransport:
+		doWebhook = true
+		postMap["event"] = "CallTransport"
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call transport %+v (meowcaller media stack consumes transport events)", mycli.userID, evt)
+	case *events.UnknownCallEvent:
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got raw call event %+v (meowcaller media stack consumes known call children)", mycli.userID, evt)
 	case *events.OfflineSyncCompleted:
 		doWebhook = true
 		postMap["event"] = "OfflineSyncCompleted"

@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	call_service "github.com/evolution-foundation/evolution-go/pkg/call/service"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -38,6 +40,47 @@ func (f *fakeStreamInstanceResolver) Info(instanceID string) (*instance_model.In
 		return instance, nil
 	}
 	return nil, errors.New("instance not found")
+}
+
+type fakeCallService struct {
+	call       *meowcaller.Call
+	forgets    atomic.Int64
+	outgoing   bool
+	instanceID string
+	callID     string
+}
+
+func (f *fakeCallService) RejectCall(*call_service.RejectCallStruct, *instance_model.Instance) error {
+	return nil
+}
+
+func (f *fakeCallService) AnswerCall(*call_service.AnswerCallStruct, *instance_model.Instance) (*meowcaller.Call, error) {
+	return f.call, nil
+}
+
+func (f *fakeCallService) HangupCall(*call_service.HangupCallStruct, *instance_model.Instance) error {
+	return nil
+}
+
+func (f *fakeCallService) GetActiveCall(instanceID, callID string) (*meowcaller.Call, error) {
+	f.instanceID = instanceID
+	f.callID = callID
+	if f.call == nil {
+		return nil, errors.New("not found")
+	}
+	return f.call, nil
+}
+
+func (f *fakeCallService) ForgetActiveCall(string, string, *meowcaller.Call) {
+	f.forgets.Add(1)
+}
+
+func (f *fakeCallService) IsOutgoingCall(string, string) bool {
+	return f.outgoing
+}
+
+func (f *fakeCallService) DialCall(*call_service.DialCallStruct, *instance_model.Instance) (*meowcaller.Call, error) {
+	return f.call, nil
 }
 
 func TestStreamAuthSignedTokenVector(t *testing.T) {
@@ -210,6 +253,69 @@ func runStreamAuthRequest(
 	return response
 }
 
+func TestStreamDisconnectDoesNotForgetCall(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resolver := &fakeStreamInstanceResolver{byToken: map[string]*instance_model.Instance{
+		"legacy-instance-token": {Id: "rekovi"},
+	}}
+	calls := &fakeCallService{call: &meowcaller.Call{}}
+	router := gin.New()
+	router.GET("/call/stream/:callId", streamAuthMiddleware(resolver, time.Now), serveStream(calls))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/call/stream/call-123?apikey=legacy-instance-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if calls.forgets.Load() != 0 {
+		t.Fatalf("stream disconnect forgot active call %d times", calls.forgets.Load())
+	}
+	if calls.instanceID != "rekovi" || calls.callID != "call-123" {
+		t.Fatalf("unexpected call lookup %q/%q", calls.instanceID, calls.callID)
+	}
+}
+
+func TestIncomingStreamSignalsMediaReadyBeforeActive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resolver := &fakeStreamInstanceResolver{byToken: map[string]*instance_model.Instance{
+		"legacy-instance-token": {Id: "rekovi"},
+	}}
+	calls := &fakeCallService{call: &meowcaller.Call{}}
+	router := gin.New()
+	router.GET("/call/stream/:callId", streamAuthMiddleware(resolver, time.Now), serveStream(calls))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/call/stream/call-123?apikey=legacy-instance-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var sawStart, sawReady bool
+	for i := 0; i < 3; i++ {
+		var msg wsMessage
+		if err := client.ReadJSON(&msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg.Event == "start" {
+			sawStart = true
+		}
+		if msg.Event == "media_ready" && msg.Direction == "incoming" {
+			sawReady = true
+		}
+	}
+	if !sawStart || !sawReady {
+		t.Fatalf("expected start and incoming media_ready before active, got start=%v ready=%v", sawStart, sawReady)
+	}
+}
+
 func TestBridgeDropsInboundUntilCallIsActive(t *testing.T) {
 	bridge := newBridge(nil)
 	if err := bridge.WriteFrame(make([]float32, 960)); err != nil {
@@ -217,8 +323,11 @@ func TestBridgeDropsInboundUntilCallIsActive(t *testing.T) {
 	}
 }
 
-func TestBridgeDoesNotReleaseOutboundAudioBeforeActive(t *testing.T) {
+func TestBridgeDoesNotReleaseOutboundAudioUntilOutboundReady(t *testing.T) {
 	bridge := newBridge(nil)
+	outbound := make([]float32, meowcaller.FrameSamples)
+	outbound[0] = 0.25
+	bridge.incoming <- outbound
 	frame, err := bridge.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
@@ -232,20 +341,23 @@ func TestBridgeDoesNotReleaseOutboundAudioBeforeActive(t *testing.T) {
 		}
 	}
 
-	bridge.allowInbound()
-	bridge.incoming <- make([]float32, meowcaller.FrameSamples)
+	bridge.allowOutbound()
 	frame, err = bridge.ReadFrame()
 	if err != nil {
-		t.Fatalf("expected frame after activation, got %v", err)
+		t.Fatalf("expected frame after outbound readiness, got %v", err)
 	}
 	if len(frame) != meowcaller.FrameSamples {
-		t.Fatalf("active frame has %d samples", len(frame))
+		t.Fatalf("ready frame has %d samples", len(frame))
+	}
+	if frame[0] != 0.25 {
+		t.Fatalf("ready frame first sample = %v, want queued outbound audio", frame[0])
 	}
 }
 
 func TestBridgeDiagnosticsRequireBidirectionalNonZeroFrames(t *testing.T) {
 	bridge := newBridge(nil)
 	bridge.allowInbound()
+	bridge.allowOutbound()
 	inbound := make([]float32, meowcaller.FrameSamples)
 	inbound[0] = 0.5
 	outbound := make([]float32, meowcaller.FrameSamples)

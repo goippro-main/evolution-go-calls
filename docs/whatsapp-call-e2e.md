@@ -75,6 +75,9 @@ Pairing-code flow:
     go run ./tools/whatsapp-call-e2e \
       -webhook-url http://127.0.0.1:8090/webhook
 
+Inbound harness держит webhook listener живым до Ctrl-C. Для конечного
+локального прогона добавьте `-max-calls N`.
+
 Для исходящего направления, после pairing:
 
     EVOLUTION_API_URL="$API" \

@@ -33,6 +33,8 @@ require (
 	modernc.org/sqlite v1.33.1
 )
 
+replace github.com/purpshell/meowcaller => ./third_party/meowcaller
+
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/KyleBanks/depth v1.2.1 // indirect

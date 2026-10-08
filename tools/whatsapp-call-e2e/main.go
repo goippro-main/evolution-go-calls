@@ -38,6 +38,7 @@ type cfg struct {
 	api, instance, key, signing, listen, webhook, out, wav string
 	mode, number                                           string
 	duration, delay, timeout                               time.Duration
+	maxCalls                                               int
 	configure                                              bool
 }
 
@@ -56,6 +57,11 @@ type wsMessage struct {
 type offer struct {
 	ID      string
 	Creator string
+}
+
+type readResult struct {
+	message wsMessage
+	err     error
 }
 
 type logger struct {
@@ -87,6 +93,7 @@ func main() {
 	flag.DurationVar(&c.duration, "duration", 8*time.Second, "stream duration")
 	flag.DurationVar(&c.delay, "inject-delay", 750*time.Millisecond, "delay before marker injection")
 	flag.DurationVar(&c.timeout, "http-timeout", 10*time.Second, "HTTP timeout")
+	flag.IntVar(&c.maxCalls, "max-calls", 0, "inbound calls to process before exiting; 0 means keep listening until interrupted")
 	flag.BoolVar(&c.configure, "configure", true, "configure /instance/connect with this webhook")
 	flag.Parse()
 	if c.instance == "" || c.key == "" {
@@ -118,10 +125,17 @@ func main() {
 	server := &http.Server{Addr: c.listen, ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleWebhook(w, r, offers, l)
 	})}
+	listener, err := net.Listen("tcp", c.listen)
+	if err != nil {
+		l.write("webhook_listen_failed", map[string]any{"listen": c.listen, "error": err.Error()})
+		log.Fatal(err)
+	}
+	l.write("webhook_listening", map[string]any{"listen": listener.Addr().String(), "url": c.webhook})
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			l.write("webhook_server_error", map[string]any{"error": err.Error()})
 		}
+		l.write("webhook_server_stopped", nil)
 	}()
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -137,25 +151,55 @@ func main() {
 		}
 		l.write("configure_succeeded", nil)
 	}
-	callID, err := prepareCall(ctx, client, c, offers, l)
-	if err != nil {
+	if err := runCalls(ctx, client, c, offers, l); err != nil {
 		log.Fatal(err)
 	}
-	hangupDone, streamErr := stream(client, ctx, c, callID, l)
-	if streamErr != nil {
-		l.write("stream_failed", map[string]any{"callId": callID, "error": streamErr.Error()})
-		log.Printf("stream: %v", streamErr)
-	}
-	if !hangupDone {
-		if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": callID}); err != nil {
-			l.write("hangup_failed", map[string]any{"callId": callID, "error": err.Error()})
-			log.Printf("hangup: %v", err)
-		} else {
-			l.write("hangup_succeeded", map[string]any{"callId": callID})
+}
+
+func runCalls(ctx context.Context, client *http.Client, c cfg, offers <-chan offer, l *logger) error {
+	processed := 0
+	for {
+		if c.mode == "outbound" && processed > 0 {
+			return nil
 		}
-	}
-	if streamErr != nil {
-		log.Fatal(streamErr)
+		if c.mode == "inbound" && c.maxCalls > 0 && processed >= c.maxCalls {
+			l.write("max_calls_reached", map[string]any{"maxCalls": c.maxCalls})
+			return nil
+		}
+		callID, err := prepareCall(ctx, client, c, offers, l)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			l.write("call_prepare_failed", map[string]any{"error": err.Error()})
+			if c.mode == "outbound" {
+				return err
+			}
+			continue
+		}
+		processed++
+		l.write("call_attempt_started", map[string]any{"callId": callID, "attempt": processed})
+		hangupDone, streamErr := stream(client, ctx, c, callID, l)
+		if streamErr != nil {
+			l.write("stream_failed", map[string]any{"callId": callID, "error": streamErr.Error()})
+			log.Printf("stream: %v", streamErr)
+		}
+		if !hangupDone {
+			if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": callID}); err != nil {
+				l.write("hangup_failed", map[string]any{"callId": callID, "error": err.Error()})
+				log.Printf("hangup: %v", err)
+			} else {
+				l.write("hangup_succeeded", map[string]any{"callId": callID})
+			}
+		}
+		if streamErr != nil {
+			l.write("call_attempt_failed", map[string]any{"callId": callID, "attempt": processed, "error": streamErr.Error()})
+			if c.mode == "outbound" {
+				return streamErr
+			}
+			continue
+		}
+		l.write("call_attempt_succeeded", map[string]any{"callId": callID, "attempt": processed})
 	}
 }
 
@@ -349,6 +393,8 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	reads := make(chan readResult, 1)
+	go readMessages(conn, reads)
 	ready := make(chan struct{})
 	var readyOnce sync.Once
 	markReady := func(reason string) {
@@ -363,7 +409,8 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 	defer deadline.Stop()
 	var hangupDone bool
 	var serverStats map[string]any
-	var closeDeadline *time.Timer
+	deadlineC := deadline.C
+	var closeDeadlineC <-chan time.Time
 	finish := func() (bool, error) {
 		if err := validateMedia(c.mode, rec.summary(), serverStats); err != nil {
 			l.write("media_validation_fail", map[string]any{"callId": callID, "mode": c.mode, "error": err.Error(), "server": serverStats})
@@ -373,35 +420,35 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 		return hangupDone, nil
 	}
 	for {
+		var message wsMessage
 		select {
 		case <-streamCtx.Done():
 			return false, streamCtx.Err()
-		case <-deadline.C:
+		case <-deadlineC:
 			l.write("stream_duration_elapsed", map[string]any{"callId": callID})
 			if err := post(client, c.api+"/call/hangup", c.key, map[string]string{"callId": callID}); err != nil {
 				return false, fmt.Errorf("hangup at stream deadline: %w", err)
 			}
 			hangupDone = true
 			l.write("hangup_succeeded", map[string]any{"callId": callID})
-			closeDeadline = time.NewTimer(2 * time.Second)
-		default:
-		}
-		if closeDeadline != nil {
-			select {
-			case <-closeDeadline.C:
-				return finish()
-			default:
+			deadlineC = nil
+			closeTimer := time.NewTimer(2 * time.Second)
+			defer closeTimer.Stop()
+			closeDeadlineC = closeTimer.C
+			continue
+		case <-closeDeadlineC:
+			return finish()
+		case result := <-reads:
+			if result.err == nil {
+				message = result.message
+				break
 			}
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		var message wsMessage
-		if err := conn.ReadJSON(&message); err != nil {
-			if timeoutError(err) {
-				continue
-			}
+			err := result.err
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				l.write("ws_closed", map[string]any{"callId": callID, "error": err.Error()})
 				return finish()
 			}
+			l.write("stream_read_error", map[string]any{"callId": callID, "error": err.Error()})
 			return false, err
 		}
 		switch message.Event {
@@ -416,6 +463,11 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 			l.write("peer_accept", map[string]any{"callId": callID, "direction": message.Direction})
 			if c.mode == "outbound" {
 				markReady("peer_accept")
+			}
+		case "media_ready":
+			l.write("media_ready_signal", map[string]any{"callId": callID, "direction": message.Direction})
+			if c.mode == "inbound" {
+				markReady("media_ready")
 			}
 		case "media":
 			if message.Track != "inbound" {
@@ -437,6 +489,17 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 			l.write("ws_stop", map[string]any{"callId": callID, "reason": message.Reason})
 			return finish()
 		}
+	}
+}
+
+func readMessages(conn *websocket.Conn, out chan<- readResult) {
+	for {
+		var message wsMessage
+		if err := conn.ReadJSON(&message); err != nil {
+			out <- readResult{err: err}
+			return
+		}
+		out <- readResult{message: message}
 	}
 }
 

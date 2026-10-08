@@ -122,15 +122,12 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 		outgoing := callService.IsOutgoingCall(instance.Id, callID)
 		defer func() {
 			_ = b.Close()
-			if call.State() != meowcaller.CallPhaseEnded {
-				_ = call.Hangup()
-			}
-			callService.ForgetActiveCall(instance.Id, callID, call)
 		}()
 
 		call.OnStateChange(func(phase meowcaller.CallPhase) {
 			if phase == meowcaller.CallPhaseActive {
 				b.allowInbound()
+				b.allowOutbound()
 			}
 			_ = b.writeState(callID, callPhaseName(phase), callDirectionName(outgoing))
 			if phase == meowcaller.CallPhaseEnded {
@@ -142,10 +139,17 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 			// precede CallPhaseActive, which waits for the first RTP exchange.
 			call.OnPeerAccept(func() {
 				b.allowInbound()
+				b.allowOutbound()
 				_ = b.writeJSON(wsMessage{Event: "peer_accept", CallID: callID, Direction: "outgoing"})
 			})
 		} else if call.State() == meowcaller.CallPhaseActive {
 			b.allowInbound()
+			b.allowOutbound()
+		} else {
+			// For answered inbound calls, operator/AI audio must be allowed before
+			// CallPhaseActive. Active is only reached after inbound RTP is decoded,
+			// and waiting for it can deadlock "callee speaks first" flows into silence.
+			b.allowOutbound()
 		}
 		if call.State() == meowcaller.CallPhaseEnded {
 			return
@@ -157,6 +161,9 @@ func serveStream(callService call_service.CallService) gin.HandlerFunc {
 		_ = b.writeState(callID, callPhaseName(call.State()), callDirectionName(outgoing))
 		if err := b.writeStart(callID); err != nil {
 			return
+		}
+		if !outgoing {
+			_ = b.writeJSON(wsMessage{Event: "media_ready", CallID: callID, Direction: "incoming"})
 		}
 		_ = b.readLoop()
 	}
