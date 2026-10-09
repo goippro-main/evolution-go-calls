@@ -396,7 +396,9 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 	}
 	defer func() {
 		rec.close()
-		l.write("audio_summary", rec.summary())
+		summary := rec.summary()
+		summary["callId"] = callID
+		l.write("audio_summary", summary)
 	}()
 	outboundMode := resolvedOutboundMode(c.outboundMode, c.wav)
 	source, sourceName, err := outbound(outboundMode, c.wav)
@@ -407,7 +409,7 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 	if err := writeWAV(outboundPath, source); err != nil {
 		return false, err
 	}
-	l.write("outbound_source", map[string]any{"name": sourceName, "mode": outboundMode, "wav": outboundPath, "samples": len(source), "durationMs": float64(len(source)) * 1000 / rate})
+	l.write("outbound_source", map[string]any{"callId": callID, "name": sourceName, "mode": outboundMode, "wav": outboundPath, "samples": len(source), "durationMs": float64(len(source)) * 1000 / rate})
 	var writeMu sync.Mutex
 	write := func(message wsMessage) error {
 		writeMu.Lock()
@@ -580,16 +582,32 @@ func inject(ctx context.Context, ready <-chan struct{}, write func(wsMessage) er
 }
 
 func validateMedia(mode string, inbound, server map[string]any) error {
-	if positiveCounter(inbound, "inboundFrames") == 0 || positiveCounter(inbound, "nonZeroFrames") == 0 {
-		return fmt.Errorf("%s media failed: recorder has no non-zero inbound audio (frames=%d nonZeroFrames=%d)", mode, positiveCounter(inbound, "inboundFrames"), positiveCounter(inbound, "nonZeroFrames"))
+	if !audibleEvidence(inbound, "inbound") {
+		return fmt.Errorf("%s media failed: recorder has insufficient inbound audio (frames=%d nonZeroFrames=%d nonZeroSamples=%d peak=%d)", mode, positiveCounter(inbound, "inboundFrames"), positiveCounter(inbound, "nonZeroFrames"), positiveCounter(inbound, "nonZeroSamples"), positiveCounter(inbound, "peak"))
 	}
 	if server == nil {
 		return errors.New("media failed: server diagnostics were not received")
 	}
-	if positiveCounter(server, "outboundFrames") == 0 || positiveCounter(server, "outboundNonZeroFrames") == 0 {
-		return fmt.Errorf("%s media failed: bridge injected no non-zero outbound audio (frames=%d nonZeroFrames=%d)", mode, positiveCounter(server, "outboundFrames"), positiveCounter(server, "outboundNonZeroFrames"))
+	if !audibleEvidence(server, "outbound") {
+		return fmt.Errorf("%s media failed: bridge injected insufficient outbound audio (frames=%d nonZeroFrames=%d nonZeroSamples=%d peak=%d)", mode, positiveCounter(server, "outboundFrames"), positiveCounter(server, "outboundNonZeroFrames"), positiveCounter(server, "outboundNonZeroSamples"), positiveCounter(server, "outboundPeak"))
 	}
 	return nil
+}
+
+func audibleEvidence(values map[string]any, prefix string) bool {
+	framesKey := prefix + "Frames"
+	nonZeroFramesKey := prefix + "NonZeroFrames"
+	nonZeroSamplesKey := prefix + "NonZeroSamples"
+	peakKey := prefix + "Peak"
+	if prefix == "inbound" {
+		nonZeroFramesKey = "nonZeroFrames"
+		nonZeroSamplesKey = "nonZeroSamples"
+		peakKey = "peak"
+	}
+	return positiveCounter(values, framesKey) > 0 &&
+		positiveCounter(values, nonZeroFramesKey) >= 3 &&
+		positiveCounter(values, nonZeroSamplesKey) >= int64(rate/20) &&
+		positiveCounter(values, peakKey) >= 512
 }
 
 func positiveCounter(values map[string]any, key string) int64 {

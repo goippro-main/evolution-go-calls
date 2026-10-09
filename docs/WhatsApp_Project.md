@@ -1,3 +1,6 @@
+## Update 2026-10-09 15:13 Europe/Lisbon - spoken TTS heard over WhatsApp
+A real inbound WhatsApp call confirmed audible spoken outbound audio. Call ID `006AE5ED03D73C7F396E9A53CEFD5BB4` used harness `-outbound-mode wav` with source `/private/tmp/wa-call-e2e-harness-live/runtime-audio/spoken-marker-16k-20261009T140925Z.wav`; this is not the previous formant/tone marker. The user reported that the answer was heard, the sound was imperfect, and the words were intelligible. Server stats: outbound 162 frames / 162 nonzero / 150649 nonzero samples / peak 25719 / 0 dropped frames. Inbound remained absent for this call (`inboundFrames=0`, header-only inbound WAV), so STT and conversational AI are the next unresolved path. Live services were not restarted; backup is `/private/tmp/wa-call-e2e-confirmed-speech-backup-20261009T141710Z`.
+
 # WhatsApp Project
 
 Date: 2026-10-08

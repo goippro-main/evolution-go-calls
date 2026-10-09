@@ -18,17 +18,26 @@ import (
 )
 
 func TestValidateMediaRejectsSilence(t *testing.T) {
-	err := validateMedia("inbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(0)}, map[string]any{
-		"outboundFrames": int64(3), "outboundNonZeroFrames": int64(3),
+	err := validateMedia("inbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(0), "nonZeroSamples": int64(0), "peak": int64(0)}, map[string]any{
+		"outboundFrames": int64(3), "outboundNonZeroFrames": int64(3), "outboundNonZeroSamples": int64(1200), "outboundPeak": int64(1200),
 	})
 	if err == nil {
 		t.Fatal("expected silent inbound audio to fail")
 	}
 }
 
+func TestValidateMediaRejectsTinyNoise(t *testing.T) {
+	err := validateMedia("inbound", map[string]any{"inboundFrames": int64(66), "nonZeroFrames": int64(1), "nonZeroSamples": int64(231), "peak": int64(118)}, map[string]any{
+		"outboundFrames": int64(163), "outboundNonZeroFrames": int64(129), "outboundNonZeroSamples": int64(93627), "outboundPeak": int64(8749),
+	})
+	if err == nil {
+		t.Fatal("expected tiny inbound noise to fail")
+	}
+}
+
 func TestValidateMediaRequiresServerOutboundEvidence(t *testing.T) {
-	err := validateMedia("outbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(2)}, map[string]any{
-		"outboundFrames": int64(0), "outboundNonZeroFrames": int64(0),
+	err := validateMedia("outbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(3), "nonZeroSamples": int64(1200), "peak": int64(1200)}, map[string]any{
+		"outboundFrames": int64(0), "outboundNonZeroFrames": int64(0), "outboundNonZeroSamples": int64(0), "outboundPeak": int64(0),
 	})
 	if err == nil {
 		t.Fatal("expected missing outbound bridge media to fail")
@@ -36,8 +45,8 @@ func TestValidateMediaRequiresServerOutboundEvidence(t *testing.T) {
 }
 
 func TestValidateMediaPassesOnlyWithBothTracks(t *testing.T) {
-	err := validateMedia("outbound", map[string]any{"inboundFrames": float64(3), "nonZeroFrames": float64(2)}, map[string]any{
-		"outboundFrames": float64(3), "outboundNonZeroFrames": float64(3),
+	err := validateMedia("outbound", map[string]any{"inboundFrames": float64(82), "nonZeroFrames": float64(17), "nonZeroSamples": float64(13026), "peak": float64(31959)}, map[string]any{
+		"outboundFrames": float64(156), "outboundNonZeroFrames": float64(124), "outboundNonZeroSamples": float64(90667), "outboundPeak": float64(8749),
 	})
 	if err != nil {
 		t.Fatal(err)
