@@ -49,6 +49,18 @@ Previous call `00BCE4B2293B9C36F96840CD66295ACF` proved signaling and outbound a
 
 Do not initiate live calls, relink/logout/QR, pair Linux, change egress, or change live services without explicit approval. Do not commit or publish secrets, QR material, stored sessions, auth databases, cookies, credentials, API keys, tokens, or runtime artifacts.
 
+## Mac reboot recovery - 2026-10-09
+
+After the Mac reboot at 2026-10-09 16:26 WEST, the `/private/tmp` checkout and runtime vanished. Safe recovery moved the Mac runtime to durable home paths without QR/relink:
+
+- repo: `~/Projects/evolution-go-calls`
+- Evolution runtime: `~/evolution-go-calls-live`
+- harness runtime/artifacts: `~/wa-call-e2e-harness-live`
+- launchd labels: `com.valera.evolution-go-calls` and `com.valera.wa-call-e2e-harness`
+- preserved DB: Homebrew PostgreSQL 16 at `/opt/homebrew/var/postgresql@16`, databases `evogo_users` and `evogo_auth`
+
+The harness now ignores replayed already-ended `CallOffer` webhooks (`is_call_ended=1` or `terminate_reason`) instead of trying `/call/answer` and creating stale 404 noise during recovery.
+
 ## Next technical step
 
 Replace test tones with speech generation, add STT/AI handling for inbound audio, then validate an actual bidirectional AI voice dialogue. Separately solve PT egress for `.198` before pairing WhatsApp on Linux.

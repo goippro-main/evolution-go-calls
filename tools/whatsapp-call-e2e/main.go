@@ -302,12 +302,30 @@ func handleWebhook(w http.ResponseWriter, r *http.Request, offers chan<- offer, 
 		return
 	}
 	o := offer{ID: first(payload, "CallID", "callId", "callID"), Creator: first(payload, "CallCreator", "callCreator", "from", "From")}
+	if endedCallOffer(payload) {
+		l.write("call_offer_ignored", map[string]any{"callId": o.ID, "reason": "already-ended"})
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	select {
 	case offers <- o:
 	default:
 		l.write("call_offer_ignored", map[string]any{"callId": o.ID, "reason": "first-offer-already-selected"})
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func endedCallOffer(payload map[string]any) bool {
+	if value, ok := find(payload, "is_call_ended"); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes":
+			return true
+		}
+	}
+	if value, ok := find(payload, "terminate_reason"); ok && strings.TrimSpace(value) != "" {
+		return true
+	}
+	return false
 }
 
 func first(root map[string]any, keys ...string) string {

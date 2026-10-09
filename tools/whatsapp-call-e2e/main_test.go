@@ -66,6 +66,31 @@ func TestWebhookFindsNestedCallOffer(t *testing.T) {
 	}
 }
 
+func TestEndedCallOfferIsRecognized(t *testing.T) {
+	for _, raw := range []string{
+		`{"data":{"event":"CallOffer","callId":"abc","is_call_ended":"1"}}`,
+		`{"data":{"event":"CallOffer","callId":"abc","terminate_reason":"rejected_elsewhere"}}`,
+	} {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !endedCallOffer(payload) {
+			t.Fatalf("expected ended offer for %s", raw)
+		}
+	}
+}
+
+func TestLiveCallOfferIsNotEnded(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(`{"data":{"event":"CallOffer","callId":"abc","callCreator":"123@s.whatsapp.net"}}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if endedCallOffer(payload) {
+		t.Fatal("live offer detected as ended")
+	}
+}
+
 func TestPostJSONDecodesDialResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("apikey") != "secret" {
