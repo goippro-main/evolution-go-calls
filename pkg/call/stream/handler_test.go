@@ -378,6 +378,35 @@ func TestBridgeDiagnosticsRequireBidirectionalNonZeroFrames(t *testing.T) {
 	if stats["bidirectionalMedia"] != true {
 		t.Fatalf("expected bidirectional media evidence: %+v", stats)
 	}
+	if stats["inboundMediaState"] != "decoded_audio" {
+		t.Fatalf("inbound media state = %q, want decoded_audio", stats["inboundMediaState"])
+	}
+	if stats["inboundSpanMs"] == nil || stats["inboundStalledMs"] == nil {
+		t.Fatalf("expected inbound timing diagnostics: %+v", stats)
+	}
+	if stats["outboundSpanMs"] == nil || stats["outboundStalledMs"] == nil {
+		t.Fatalf("expected outbound timing diagnostics: %+v", stats)
+	}
+}
+
+func TestBridgeDiagnosticsClassifyDecodedSilenceOnly(t *testing.T) {
+	bridge := newBridge(nil)
+	bridge.allowInbound()
+	bridge.recordInbound(make([]float32, meowcaller.FrameSamples))
+
+	stats := bridge.diagnostics()
+	if stats["inboundFrames"] != int64(1) || stats["inboundNonZeroFrames"] != int64(0) {
+		t.Fatalf("unexpected silent inbound diagnostics: %+v", stats)
+	}
+	if stats["inboundMediaState"] != "decoded_silence_only" {
+		t.Fatalf("inbound media state = %q, want decoded_silence_only", stats["inboundMediaState"])
+	}
+	if stats["bidirectionalMedia"] != false {
+		t.Fatalf("silent-only inbound must not prove bidirectional media: %+v", stats)
+	}
+	if stats["inboundSpanMs"] == nil || stats["inboundStalledMs"] == nil {
+		t.Fatalf("expected silent inbound timing diagnostics: %+v", stats)
+	}
 }
 
 func TestFrameStatsTreatsSilenceAsZero(t *testing.T) {

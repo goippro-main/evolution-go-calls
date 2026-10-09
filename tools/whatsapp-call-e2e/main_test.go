@@ -19,10 +19,14 @@ import (
 
 func TestValidateMediaRejectsSilence(t *testing.T) {
 	err := validateMedia("inbound", map[string]any{"inboundFrames": int64(3), "nonZeroFrames": int64(0), "nonZeroSamples": int64(0), "peak": int64(0)}, map[string]any{
+		"inboundFrames": int64(18), "inboundNonZeroFrames": int64(0), "inboundMediaState": "decoded_silence_only", "inboundSpanMs": int64(820), "inboundStalledMs": int64(6825),
 		"outboundFrames": int64(3), "outboundNonZeroFrames": int64(3), "outboundNonZeroSamples": int64(1200), "outboundPeak": int64(1200),
 	})
 	if err == nil {
 		t.Fatal("expected silent inbound audio to fail")
+	}
+	if !strings.Contains(err.Error(), "serverState=decoded_silence_only") || !strings.Contains(err.Error(), "serverInboundStalledMs=6825") {
+		t.Fatalf("expected server silence/stall diagnostics in error, got %v", err)
 	}
 }
 

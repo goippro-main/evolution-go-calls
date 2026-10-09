@@ -93,22 +93,43 @@ func (b *bridge) writeState(callID, phase, direction string) error {
 }
 
 func (b *bridge) diagnostics() map[string]any {
+	now := time.Now().UTC().UnixNano()
+	firstInbound := b.firstInboundUnixNano.Load()
+	lastInbound := b.lastInboundUnixNano.Load()
+	firstOutbound := b.firstOutboundUnixNano.Load()
+	lastOutbound := b.lastOutboundUnixNano.Load()
 	return map[string]any{
 		"inboundFrames":          b.inboundFrames.Load(),
 		"inboundNonZeroFrames":   b.inboundNonZeroFrames.Load(),
 		"inboundNonZeroSamples":  b.inboundNonZeroSamples.Load(),
 		"inboundPeak":            b.inboundPeak.Load(),
+		"inboundMediaState":      b.inboundMediaState(),
+		"inboundSpanMs":          spanMillis(firstInbound, lastInbound),
+		"inboundStalledMs":       ageMillis(lastInbound, now),
 		"outboundQueuedFrames":   b.outboundQueuedFrames.Load(),
 		"outboundFrames":         b.outboundFrames.Load(),
 		"outboundNonZeroFrames":  b.outboundNonZeroFrames.Load(),
 		"outboundNonZeroSamples": b.outboundNonZeroSamples.Load(),
 		"outboundPeak":           b.outboundPeak.Load(),
+		"outboundSpanMs":         spanMillis(firstOutbound, lastOutbound),
+		"outboundStalledMs":      ageMillis(lastOutbound, now),
 		"droppedOutboundFrames":  b.droppedOutboundFrames.Load(),
-		"firstInboundTs":         unixNanoTime(b.firstInboundUnixNano.Load()),
-		"lastInboundTs":          unixNanoTime(b.lastInboundUnixNano.Load()),
-		"firstOutboundTs":        unixNanoTime(b.firstOutboundUnixNano.Load()),
-		"lastOutboundTs":         unixNanoTime(b.lastOutboundUnixNano.Load()),
+		"firstInboundTs":         unixNanoTime(firstInbound),
+		"lastInboundTs":          unixNanoTime(lastInbound),
+		"firstOutboundTs":        unixNanoTime(firstOutbound),
+		"lastOutboundTs":         unixNanoTime(lastOutbound),
 		"bidirectionalMedia":     b.inboundNonZeroFrames.Load() > 0 && b.outboundNonZeroFrames.Load() > 0,
+	}
+}
+
+func (b *bridge) inboundMediaState() string {
+	switch {
+	case b.inboundFrames.Load() == 0:
+		return "none"
+	case b.inboundNonZeroFrames.Load() == 0:
+		return "decoded_silence_only"
+	default:
+		return "decoded_audio"
 	}
 }
 
@@ -117,6 +138,20 @@ func unixNanoTime(value int64) any {
 		return nil
 	}
 	return time.Unix(0, value).UTC()
+}
+
+func spanMillis(first, last int64) any {
+	if first == 0 || last == 0 || last < first {
+		return nil
+	}
+	return time.Duration(last - first).Milliseconds()
+}
+
+func ageMillis(then, now int64) any {
+	if then == 0 || now < then {
+		return nil
+	}
+	return time.Duration(now - then).Milliseconds()
 }
 
 func (b *bridge) recordInbound(frame []float32) {

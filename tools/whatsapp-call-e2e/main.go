@@ -601,7 +601,7 @@ func inject(ctx context.Context, ready <-chan struct{}, write func(wsMessage) er
 
 func validateMedia(mode string, inbound, server map[string]any) error {
 	if !audibleEvidence(inbound, "inbound") {
-		return fmt.Errorf("%s media failed: recorder has insufficient inbound audio (frames=%d nonZeroFrames=%d nonZeroSamples=%d peak=%d)", mode, positiveCounter(inbound, "inboundFrames"), positiveCounter(inbound, "nonZeroFrames"), positiveCounter(inbound, "nonZeroSamples"), positiveCounter(inbound, "peak"))
+		return fmt.Errorf("%s media failed: recorder has insufficient inbound audio (frames=%d nonZeroFrames=%d nonZeroSamples=%d peak=%d serverState=%s serverInboundFrames=%d serverInboundNonZeroFrames=%d serverInboundSpanMs=%d serverInboundStalledMs=%d)", mode, positiveCounter(inbound, "inboundFrames"), positiveCounter(inbound, "nonZeroFrames"), positiveCounter(inbound, "nonZeroSamples"), positiveCounter(inbound, "peak"), textValue(server, "inboundMediaState"), positiveCounter(server, "inboundFrames"), positiveCounter(server, "inboundNonZeroFrames"), positiveCounter(server, "inboundSpanMs"), positiveCounter(server, "inboundStalledMs"))
 	}
 	if server == nil {
 		return errors.New("media failed: server diagnostics were not received")
@@ -629,6 +629,9 @@ func audibleEvidence(values map[string]any, prefix string) bool {
 }
 
 func positiveCounter(values map[string]any, key string) int64 {
+	if values == nil {
+		return 0
+	}
 	switch value := values[key].(type) {
 	case int64:
 		return value
@@ -639,6 +642,14 @@ func positiveCounter(values map[string]any, key string) int64 {
 	default:
 		return 0
 	}
+}
+
+func textValue(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, _ := values[key].(string)
+	return value
 }
 
 func timeoutError(err error) bool {
