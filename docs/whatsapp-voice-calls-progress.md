@@ -38,6 +38,18 @@ Do not initiate live calls, relink/logout/QR, pair Linux, change egress, or chan
 
 Replace test tones with speech generation, add STT/AI handling for inbound audio, then validate an actual bidirectional AI voice dialogue. Separately solve PT egress for `.198` before pairing WhatsApp on Linux.
 
+## Staged spoken marker change
+
+The next code change is staged on the same branch without changing the live Mac runtime. The E2E harness outbound source defaults to an offline deterministic speech marker: "this is a WhatsApp voice bridge test from GoIPpro". It is generated locally as 16 kHz mono PCM16 audio, written to `outbound-<callId>.wav` in the selected out-dir, and sent over `/call/stream/:callId` in 960-sample frames only after the existing media-ready gate.
+
+Selectable modes:
+
+- `-outbound-mode speech` (default): offline generated spoken marker, no cloud API credentials.
+- `-outbound-mode tone`: legacy 440/880/660 Hz marker.
+- `-outbound-mode wav -outbound-wav ./marker.wav`: externally prepared 16 kHz mono PCM16 WAV.
+
+Safe activation for a user-initiated inbound test call remains: keep the already running Mac service untouched, start only the harness from a clean working tree/build, wait for the operator to place the WhatsApp call, then validate `inbound-<callId>.wav`, `outbound-<callId>.wav`, and `server_diagnostics` for nonzero inbound/outbound media. Do not initiate calls, QR/relink/logout, pair Linux, or restart live launchd without explicit approval and rollback prepared.
+
 ## Durable save map
 
 - Dispatcher task: `GOIPPRO-WA-EVO-20261009`.

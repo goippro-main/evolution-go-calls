@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"net/http"
@@ -215,7 +217,7 @@ func TestPositiveCounterSupportsJSONNumbers(t *testing.T) {
 }
 
 func TestMarkerToneIsIdentifiableAndFrameAligned(t *testing.T) {
-	samples, name, err := outbound("")
+	samples, name, err := outbound("tone", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +235,108 @@ func TestMarkerToneIsIdentifiableAndFrameAligned(t *testing.T) {
 	}
 	if nonZero == 0 {
 		t.Fatal("marker is silent")
+	}
+}
+
+func TestGeneratedSpeechMarkerIsFrameAlignedAndLevelSafe(t *testing.T) {
+	samples, name, err := outbound("speech", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "generated-speech-marker") {
+		t.Fatalf("unexpected speech marker name %q", name)
+	}
+	if len(samples)%frameSamples != 0 {
+		t.Fatalf("speech marker has %d samples, not frame aligned", len(samples))
+	}
+	if len(samples) < rate || len(samples) > 5*rate {
+		t.Fatalf("speech marker duration out of expected range: samples=%d", len(samples))
+	}
+	var nonZero, peak int
+	for _, sample := range samples {
+		abs := int(sample)
+		if abs < 0 {
+			abs = -abs
+		}
+		if abs > 8 {
+			nonZero++
+		}
+		if abs > peak {
+			peak = abs
+		}
+	}
+	if nonZero < rate/2 {
+		t.Fatalf("speech marker has too few non-zero samples: %d", nonZero)
+	}
+	if peak == 0 || peak > 26000 {
+		t.Fatalf("speech marker peak = %d, want nonzero and safely below clipping", peak)
+	}
+}
+
+func TestOutboundWAVIsReadAndPaddedToFrameBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "short.wav")
+	samples := make([]int16, frameSamples+17)
+	for i := range samples {
+		samples[i] = int16(100 + i%20)
+	}
+	if err := writeWAV(path, samples); err != nil {
+		t.Fatal(err)
+	}
+	got, name, err := outbound("wav", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != path {
+		t.Fatalf("wav source name = %q", name)
+	}
+	if len(got)%frameSamples != 0 {
+		t.Fatalf("wav source not padded to frames: %d", len(got))
+	}
+	if len(got) != frameSamples*2 {
+		t.Fatalf("wav source samples = %d, want %d", len(got), frameSamples*2)
+	}
+	for i := range samples {
+		if got[i] != samples[i] {
+			t.Fatalf("sample %d = %d, want %d", i, got[i], samples[i])
+		}
+	}
+}
+
+func TestInjectSendsPCM16FramesUntilContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	ready := make(chan struct{})
+	close(ready)
+	source := []int16{1000, -1000, 500, -500}
+	messages := make(chan wsMessage, 4)
+	logFile, err := os.Create(filepath.Join(t.TempDir(), "lifecycle.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	l := &logger{enc: json.NewEncoder(logFile)}
+	go inject(ctx, ready, func(message wsMessage) error {
+		messages <- message
+		cancel()
+		return nil
+	}, source, 0, l)
+	select {
+	case message := <-messages:
+		if message.Event != "media" || message.Track != "outbound" || message.SampleRate != rate {
+			t.Fatalf("unexpected media message: %#v", message)
+		}
+		raw, err := base64.StdEncoding.DecodeString(message.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) != frameBytes {
+			t.Fatalf("payload bytes = %d, want %d", len(raw), frameBytes)
+		}
+		first := int16(binary.LittleEndian.Uint16(raw[:2]))
+		if first != 1000 {
+			t.Fatalf("first sample = %d, want source sample", first)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for injected frame")
 	}
 }
 

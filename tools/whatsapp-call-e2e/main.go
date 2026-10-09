@@ -36,7 +36,7 @@ const (
 
 type cfg struct {
 	api, instance, key, signing, listen, webhook, out, wav string
-	mode, number                                           string
+	mode, number, outboundMode                             string
 	duration, delay, timeout                               time.Duration
 	maxCalls                                               int
 	configure                                              bool
@@ -87,7 +87,8 @@ func main() {
 	flag.StringVar(&c.listen, "webhook-listen", env("E2E_WEBHOOK_LISTEN", "127.0.0.1:8090"), "webhook listen address")
 	flag.StringVar(&c.webhook, "webhook-url", os.Getenv("E2E_WEBHOOK_URL"), "webhook URL reachable by Evolution")
 	flag.StringVar(&c.out, "out-dir", env("E2E_OUT_DIR", "/tmp/evolution-go-call-e2e"), "artifact directory")
-	flag.StringVar(&c.wav, "outbound-wav", "", "optional 16 kHz mono PCM16 WAV; default is marker tone")
+	flag.StringVar(&c.outboundMode, "outbound-mode", os.Getenv("E2E_OUTBOUND_MODE"), "outbound marker source: speech, tone, or wav; default speech unless -outbound-wav is set")
+	flag.StringVar(&c.wav, "outbound-wav", "", "optional 16 kHz mono PCM16 WAV; selects wav mode when -outbound-mode is omitted")
 	flag.StringVar(&c.mode, "mode", "inbound", "call direction: inbound or outbound")
 	flag.StringVar(&c.number, "number", "", "ordinary WhatsApp number for outbound call")
 	flag.DurationVar(&c.duration, "duration", 8*time.Second, "stream duration")
@@ -104,6 +105,16 @@ func main() {
 	}
 	if c.mode == "outbound" && strings.TrimSpace(c.number) == "" {
 		log.Fatal("-number is required in outbound mode")
+	}
+	c.outboundMode = resolvedOutboundMode(c.outboundMode, c.wav)
+	if c.outboundMode != "speech" && c.outboundMode != "tone" && c.outboundMode != "wav" {
+		log.Fatal("-outbound-mode must be speech, tone, or wav")
+	}
+	if c.outboundMode == "wav" && c.wav == "" {
+		log.Fatal("-outbound-wav is required when -outbound-mode=wav")
+	}
+	if c.outboundMode != "wav" && c.wav != "" {
+		log.Fatal("-outbound-wav can only be used with -outbound-mode=wav")
 	}
 	if c.webhook == "" {
 		c.webhook = "http://" + c.listen + "/webhook"
@@ -252,6 +263,16 @@ func authMode(key string) string {
 	return "apikey"
 }
 
+func resolvedOutboundMode(mode, wav string) string {
+	if mode != "" {
+		return mode
+	}
+	if wav != "" {
+		return "wav"
+	}
+	return "speech"
+}
+
 func (l *logger) write(event string, fields map[string]any) {
 	record := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "event": event}
 	for key, value := range fields {
@@ -377,11 +398,16 @@ func stream(client *http.Client, ctx context.Context, c cfg, callID string, l *l
 		rec.close()
 		l.write("audio_summary", rec.summary())
 	}()
-	source, sourceName, err := outbound(c.wav)
+	outboundMode := resolvedOutboundMode(c.outboundMode, c.wav)
+	source, sourceName, err := outbound(outboundMode, c.wav)
 	if err != nil {
 		return false, err
 	}
-	l.write("outbound_source", map[string]any{"name": sourceName})
+	outboundPath := filepath.Join(c.out, "outbound-"+callID+".wav")
+	if err := writeWAV(outboundPath, source); err != nil {
+		return false, err
+	}
+	l.write("outbound_source", map[string]any{"name": sourceName, "mode": outboundMode, "wav": outboundPath, "samples": len(source), "durationMs": float64(len(source)) * 1000 / rate})
 	var writeMu sync.Mutex
 	write := func(message wsMessage) error {
 		writeMu.Lock()
@@ -701,8 +727,11 @@ func (r *recorder) close() {
 	r.file = nil
 }
 
-func outbound(path string) ([]int16, string, error) {
-	if path == "" {
+func outbound(mode, path string) ([]int16, string, error) {
+	switch mode {
+	case "speech":
+		return generatedSpeechMarker(), "generated-speech-marker: this is a whatsapp voice bridge test from goippro", nil
+	case "tone":
 		samples := make([]int16, rate*3)
 		frequencies := []float64{440, 880, 660}
 		for i := range samples {
@@ -713,33 +742,227 @@ func outbound(path string) ([]int16, string, error) {
 			}
 			samples[i] = int16(math.Sin(2*math.Pi*frequency*float64(i)/rate) * envelope * 32767)
 		}
-		return samples, "generated-marker-440-880-660Hz", nil
+		return padToFrame(samples), "generated-marker-440-880-660Hz", nil
+	case "wav":
+		samples, err := readPCM16WAV(path)
+		if err != nil {
+			return nil, "", err
+		}
+		return padToFrame(samples), path, nil
+	default:
+		return nil, "", fmt.Errorf("unknown outbound mode %q", mode)
 	}
+}
+
+func readPCM16WAV(path string) ([]int16, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if len(raw) < 44 || string(raw[:4]) != "RIFF" || string(raw[8:12]) != "WAVE" {
-		return nil, "", errors.New("outbound WAV is not RIFF/WAVE")
+		return nil, errors.New("outbound WAV is not RIFF/WAVE")
 	}
 	if binary.LittleEndian.Uint16(raw[22:24]) != 1 || binary.LittleEndian.Uint32(raw[24:28]) != rate || binary.LittleEndian.Uint16(raw[34:36]) != 16 {
-		return nil, "", errors.New("outbound WAV must be mono PCM16 16 kHz")
+		return nil, errors.New("outbound WAV must be mono PCM16 16 kHz")
 	}
 	offset := bytesIndex(raw, []byte("data"), 36)
 	if offset < 0 || offset+8 > len(raw) {
-		return nil, "", errors.New("outbound WAV has no data chunk")
+		return nil, errors.New("outbound WAV has no data chunk")
 	}
 	size := int(binary.LittleEndian.Uint32(raw[offset+4:]))
 	start := offset + 8
 	if size > len(raw)-start || size == 0 {
-		return nil, "", errors.New("outbound WAV data chunk is invalid")
+		return nil, errors.New("outbound WAV data chunk is invalid")
 	}
 	raw = raw[start : start+size]
 	samples := make([]int16, len(raw)/2)
 	for i := range samples {
 		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
 	}
-	return samples, path, nil
+	return samples, nil
+}
+
+type speechPart struct {
+	kind string
+	ms   int
+	vow  string
+	amp  float64
+}
+
+func generatedSpeechMarker() []int16 {
+	// Fixed, synthetic, offline phrase: "this is a WhatsApp voice bridge test from GoIPpro".
+	// It is intentionally robotic and impersonal: a deterministic marker, not a cloned voice.
+	parts := []speechPart{
+		{kind: "silence", ms: 180},
+		{kind: "noise", ms: 55, amp: 0.045}, {kind: "vowel", vow: "ih", ms: 95, amp: 0.23}, {kind: "noise", ms: 45, amp: 0.055},
+		{kind: "silence", ms: 40},
+		{kind: "vowel", vow: "ih", ms: 85, amp: 0.21}, {kind: "noise", ms: 60, amp: 0.045},
+		{kind: "silence", ms: 60},
+		{kind: "vowel", vow: "uh", ms: 80, amp: 0.20}, {kind: "vowel", vow: "aa", ms: 115, amp: 0.24}, {kind: "noise", ms: 65, amp: 0.055},
+		{kind: "silence", ms: 35},
+		{kind: "vowel", vow: "ae", ms: 95, amp: 0.24}, {kind: "stop", ms: 70, amp: 0.05},
+		{kind: "silence", ms: 90},
+		{kind: "vowel", vow: "oy", ms: 120, amp: 0.24}, {kind: "noise", ms: 55, amp: 0.045},
+		{kind: "silence", ms: 55},
+		{kind: "stop", ms: 45, amp: 0.05}, {kind: "vowel", vow: "ih", ms: 75, amp: 0.22}, {kind: "vowel", vow: "ih", ms: 70, amp: 0.18}, {kind: "noise", ms: 55, amp: 0.055},
+		{kind: "silence", ms: 65},
+		{kind: "noise", ms: 50, amp: 0.045}, {kind: "vowel", vow: "eh", ms: 100, amp: 0.24}, {kind: "noise", ms: 60, amp: 0.055},
+		{kind: "silence", ms: 75},
+		{kind: "noise", ms: 55, amp: 0.05}, {kind: "vowel", vow: "ah", ms: 105, amp: 0.23}, {kind: "vowel", vow: "ah", ms: 65, amp: 0.16},
+		{kind: "silence", ms: 80},
+		{kind: "vowel", vow: "ow", ms: 105, amp: 0.24}, {kind: "vowel", vow: "ay", ms: 90, amp: 0.22},
+		{kind: "silence", ms: 45},
+		{kind: "stop", ms: 45, amp: 0.055}, {kind: "vowel", vow: "iy", ms: 95, amp: 0.24},
+		{kind: "silence", ms: 45},
+		{kind: "stop", ms: 45, amp: 0.055}, {kind: "vowel", vow: "ow", ms: 130, amp: 0.24},
+		{kind: "silence", ms: 420},
+	}
+	var samples []int16
+	phase := 0.0
+	for _, part := range parts {
+		switch part.kind {
+		case "vowel":
+			generated, nextPhase := synthVowel(part.vow, part.ms, part.amp, phase)
+			phase = nextPhase
+			samples = append(samples, generated...)
+		case "noise":
+			samples = append(samples, synthNoise(part.ms, part.amp)...)
+		case "stop":
+			samples = append(samples, synthStop(part.ms, part.amp)...)
+		default:
+			samples = append(samples, make([]int16, msSamples(part.ms))...)
+		}
+	}
+	return padToFrame(samples)
+}
+
+func synthVowel(name string, ms int, amp, phase float64) ([]int16, float64) {
+	formants := map[string][3]float64{
+		"aa": {730, 1090, 2440}, "ae": {660, 1720, 2410}, "ah": {640, 1190, 2390},
+		"ay": {500, 1800, 2550}, "eh": {530, 1840, 2480}, "ih": {390, 1990, 2550},
+		"iy": {270, 2290, 3010}, "ow": {570, 840, 2410}, "oy": {480, 1500, 2520},
+		"uh": {440, 1020, 2240},
+	}
+	ff, ok := formants[name]
+	if !ok {
+		ff = formants["ah"]
+	}
+	count := msSamples(ms)
+	out := make([]int16, count)
+	for i := range out {
+		t := float64(i) / rate
+		x := float64(i) / float64(maxInt(1, count-1))
+		env := math.Sin(math.Pi * x)
+		if env < 0 {
+			env = 0
+		}
+		pitch := 125.0 - 18.0*x
+		phase += 2 * math.Pi * pitch / rate
+		glottal := 0.62*math.Sin(phase) + 0.22*math.Sin(2*phase) + 0.08*math.Sin(3*phase)
+		resonance := 0.34*math.Sin(2*math.Pi*ff[0]*t) + 0.19*math.Sin(2*math.Pi*ff[1]*t) + 0.10*math.Sin(2*math.Pi*ff[2]*t)
+		value := (0.72*glottal + resonance) * env * amp
+		out[i] = clampPCM(value)
+	}
+	return out, math.Mod(phase, 2*math.Pi)
+}
+
+func synthNoise(ms int, amp float64) []int16 {
+	out := make([]int16, msSamples(ms))
+	var state uint32 = 0x5eed1234
+	var previous float64
+	for i := range out {
+		state = state*1664525 + 1013904223
+		white := (float64(int32(state>>1)%20001) / 10000.0) - 1.0
+		previous = 0.72*previous + 0.28*white
+		x := float64(i) / float64(maxInt(1, len(out)-1))
+		env := math.Sin(math.Pi * x)
+		out[i] = clampPCM(previous * env * amp)
+	}
+	return out
+}
+
+func synthStop(ms int, amp float64) []int16 {
+	out := make([]int16, msSamples(ms))
+	burst := synthNoise(minInt(ms, 18), amp)
+	copy(out, burst)
+	return out
+}
+
+func msSamples(ms int) int {
+	return int(math.Round(float64(ms) * rate / 1000))
+}
+
+func padToFrame(samples []int16) []int16 {
+	if len(samples) == 0 || len(samples)%frameSamples == 0 {
+		return samples
+	}
+	padded := make([]int16, len(samples)+(frameSamples-len(samples)%frameSamples))
+	copy(padded, samples)
+	return padded
+}
+
+func writeWAV(path string, samples []int16) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	dataBytes := uint32(len(samples) * 2)
+	header := make([]byte, 44)
+	copy(header[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(header[4:8], 36+dataBytes)
+	copy(header[8:12], "WAVE")
+	copy(header[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(header[16:20], 16)
+	binary.LittleEndian.PutUint16(header[20:22], 1)
+	binary.LittleEndian.PutUint16(header[22:24], 1)
+	binary.LittleEndian.PutUint32(header[24:28], rate)
+	binary.LittleEndian.PutUint32(header[28:32], rate*2)
+	binary.LittleEndian.PutUint16(header[32:34], 2)
+	binary.LittleEndian.PutUint16(header[34:36], 16)
+	copy(header[36:40], "data")
+	binary.LittleEndian.PutUint32(header[40:44], dataBytes)
+	if _, err := file.Write(header); err != nil {
+		return err
+	}
+	for _, sample := range samples {
+		var raw [2]byte
+		binary.LittleEndian.PutUint16(raw[:], uint16(sample))
+		if _, err := file.Write(raw[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func clampPCM(value float64) int16 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	if value > 0.95 {
+		value = 0.95
+	}
+	if value < -0.95 {
+		value = -0.95
+	}
+	return int16(math.Round(value * 32767))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func bytesIndex(haystack, needle []byte, start int) int {
