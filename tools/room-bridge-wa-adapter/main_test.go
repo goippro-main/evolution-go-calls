@@ -222,6 +222,125 @@ func TestAdapterMapsEvolutionAndRoomBridgeProtocolsOffline(t *testing.T) {
 	}
 }
 
+func TestAdapterLifecycleEventsDoNotStartRoomBeforeAudio(t *testing.T) {
+	inbound := frameWithSample(1400)
+
+	type roomCapture struct {
+		start roomMessage
+		media roomMessage
+		stop  roomMessage
+	}
+	roomSeen := make(chan roomCapture, 1)
+	roomConnected := make(chan struct{}, 1)
+	roomServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		roomConnected <- struct{}{}
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("room upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		var start roomMessage
+		if err := readJSON(conn, time.Second, &start); err != nil {
+			t.Errorf("room start read: %v", err)
+			return
+		}
+		var media roomMessage
+		if err := readJSON(conn, time.Second, &media); err != nil {
+			t.Errorf("room media read: %v", err)
+			return
+		}
+		var stop roomMessage
+		if err := readJSON(conn, time.Second, &stop); err != nil {
+			t.Errorf("room stop read: %v", err)
+			return
+		}
+		roomSeen <- roomCapture{start: start, media: media, stop: stop}
+	}))
+	defer roomServer.Close()
+
+	evoLifecycleSent := make(chan struct{})
+	evoContinue := make(chan struct{})
+	evoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("evolution upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		_ = writeJSON(conn, time.Second, evolutionMessage{Event: "start", CallID: "lifecycle-call", SampleRate: sampleRate, Direction: "incoming"})
+		_ = writeJSON(conn, time.Second, evolutionMessage{Event: "state", CallID: "lifecycle-call", Phase: "active", Direction: "incoming"})
+		_ = writeJSON(conn, time.Second, evolutionMessage{Event: "media_ready", CallID: "lifecycle-call", Direction: "incoming"})
+		close(evoLifecycleSent)
+		<-evoContinue
+		_ = writeJSON(conn, time.Second, evolutionMessage{
+			Event:      "media",
+			CallID:     "lifecycle-call",
+			SampleRate: sampleRate,
+			Track:      "inbound",
+			Payload:    base64.StdEncoding.EncodeToString(inbound),
+		})
+		_ = writeJSON(conn, time.Second, evolutionMessage{Event: "stop", CallID: "lifecycle-call"})
+	}))
+	defer evoServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		errs <- run(ctx, config{
+			evolutionURL:      wsURLFromHTTP(evoServer.URL) + "/call/stream/lifecycle-call?instance=sala2&exp=1800000000&token=signed",
+			roomBridgeURL:     wsURLFromHTTP(roomServer.URL),
+			dir:               "pt2ru",
+			roomPrefix:        "wa-call-",
+			lockDir:           t.TempDir(),
+			readTimeout:       2 * time.Second,
+			writeTimeout:      time.Second,
+			pingInterval:      0,
+			vadThreshold:      300,
+			prespeechFrames:   0,
+			maxQueuedFrames:   2,
+			maxRoomReconnects: 0,
+		})
+	}()
+
+	select {
+	case <-evoLifecycleSent:
+	case <-time.After(time.Second):
+		t.Fatal("Evolution fake did not send lifecycle messages")
+	}
+	select {
+	case <-roomConnected:
+		t.Fatal("room bridge connected before inbound audio")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(evoContinue)
+
+	var room roomCapture
+	select {
+	case room = <-roomSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("room bridge did not receive audio lifecycle")
+	}
+	if room.start.Event != "start" || room.start.Start == nil || room.start.Start.CallSid != "lifecycle-call" {
+		t.Fatalf("bad room start: %#v", room.start)
+	}
+	if room.media.Event != "media" || room.media.Media == nil || room.media.Media.Track != "inbound" {
+		t.Fatalf("bad room media: %#v", room.media)
+	}
+	if room.stop.Event != "stop" {
+		t.Fatalf("bad room stop: %#v", room.stop)
+	}
+	select {
+	case err := <-errs:
+		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Fatalf("adapter run failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("adapter did not stop after Evolution stop")
+	}
+}
+
 func TestAdapterDoesNotConnectRoomBridgeForSilenceOnly(t *testing.T) {
 	var roomConnections atomicCounter
 	roomServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

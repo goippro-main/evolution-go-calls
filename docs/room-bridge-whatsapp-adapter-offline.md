@@ -34,7 +34,27 @@ New standalone tool:
 
 ```bash
 go run ./tools/room-bridge-wa-adapter \
+  -mode adapter \
   -evolution-ws-url 'ws://127.0.0.1:4000/call/stream/CALL_ID?instance=INSTANCE&exp=EXP&token=TOKEN' \
+  -room-bridge-ws-url 'ws://127.0.0.1:8191' \
+  -dir pt2ru
+```
+
+Controlled one-call inbound orchestrator:
+
+```bash
+go run ./tools/room-bridge-wa-adapter \
+  -mode orchestrator \
+  -api "$EVOLUTION_API_URL" \
+  -instance "$EVOLUTION_INSTANCE" \
+  -apikey "$EVOLUTION_INSTANCE_API_KEY" \
+  -signing-key "$CALL_STREAM_SIGNING_KEY" \
+  -webhook-listen 127.0.0.1:8090 \
+  -webhook-url "$ORCHESTRATOR_WEBHOOK_URL" \
+  -rollback-webhook-url "$PREVIOUS_HARNESS_WEBHOOK_URL" \
+  -allow-caller '351900000001@s.whatsapp.net' \
+  -configure-cutover \
+  -call-time-limit 90s \
   -room-bridge-ws-url 'ws://127.0.0.1:8191' \
   -dir pt2ru
 ```
@@ -52,6 +72,11 @@ Security defaults:
   duplicate local owners for the same Evolution call stream.
 - The room ID is derived from the WhatsApp `callId`, e.g.
   `wa-call-007A27AF8C472B94720D093224287272`.
+- Orchestrator mode requires an explicit `-allow-caller` allowlist, accepts only
+  one inbound `CallOffer`, never calls `/call/dial`, signs the stream URL itself,
+  hangs up on completion or `-call-time-limit`, and restores
+  `-rollback-webhook-url` after success, failure, timeout, or ignored calls.
+- Orchestrator mode does not log the instance token or stream signing key.
 
 Runtime behavior:
 
@@ -80,7 +105,12 @@ The tests use local `httptest` WebSocket doubles for both protocols. They verify
   frames.
 - callId-scoped room query generation.
 - Silence-only input does not connect to room bridge.
+- Lifecycle-only `start`/`state`/`media_ready` does not connect to room bridge;
+  the Gemini room is opened only after inbound audio crosses VAD.
 - Local lock blocks duplicate adapter owners for the same call.
+- Orchestrator integration with mock Evolution HTTP+WS and fake loopback Gemini
+  room_bridge, including allowlist rejection, answer failure, room failure,
+  hangup, one-call behavior, HMAC stream URL, no `/call/dial`, and rollback.
 
 Tests do not contact paid Gemini, production `.198`, Evolution live services,
 WhatsApp, launchd, QR, or the protected backup.
@@ -93,13 +123,21 @@ window:
 
 1. Keep the protected backup untouched:
    `/Users/valera/whatsapp-evolution-go-stop-backups/20261010T145357+0100`.
-2. Stop or stand down the current harness only for the approved test window.
+2. Confirm the current harness webhook URL, e.g. `http://127.0.0.1:8090/webhook`,
+   and pass it as `-rollback-webhook-url`.
 3. Open a private loopback tunnel to `.198:127.0.0.1:8191`, or run an equivalent
    secured local room bridge endpoint. Do not expose an unauthenticated WS.
-4. Generate a short-lived HMAC Evolution stream URL for the single target call.
-5. Start this adapter with that URL and the local tunnel URL.
-6. If no bidirectional media is observed, close the adapter and restore the
-   current harness as rollback.
+4. Start orchestrator mode with `-configure-cutover`, one exact `-allow-caller`,
+   and a short `-call-time-limit`. It temporarily points `/instance/connect` at
+   its webhook, answers only that inbound caller, creates the HMAC stream URL,
+   owns the single stream, and bridges to loopback room_bridge.
+5. Have the allowlisted user place exactly one WhatsApp audio call. Do not start
+   the old harness as a competing stream owner during this window.
+6. Wait for orchestrator exit. It sends `/call/hangup` and restores
+   `-rollback-webhook-url` automatically. If it exits before answering, it still
+   restores the previous webhook.
+7. Only after logs show rollback restored should the previous harness be treated
+   as active again.
 
 Remaining live proof: one user-approved controlled WhatsApp call demonstrating
 that room bridge Gemini audio returns to the WhatsApp call without a feedback

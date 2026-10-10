@@ -134,7 +134,10 @@ type adapterStats struct {
 }
 
 func main() {
+	mode := "adapter"
 	c := config{}
+	oc := orchestratorConfig{}
+	flag.StringVar(&mode, "mode", "adapter", "run mode: adapter or orchestrator")
 	flag.StringVar(&c.evolutionURL, "evolution-ws-url", "", "Evolution Go /call/stream/<callId> WS URL with signed HMAC query")
 	flag.StringVar(&c.roomBridgeURL, "room-bridge-ws-url", "", "loopback/tunnel WS URL for room_bridge.js, e.g. ws://127.0.0.1:8191")
 	flag.StringVar(&c.callID, "call-id", "", "optional explicit callId; default is parsed from Evolution stream path")
@@ -149,11 +152,34 @@ func main() {
 	flag.IntVar(&c.prespeechFrames, "prespeech-frames", 5, "silent preroll frames flushed when speech starts")
 	flag.IntVar(&c.maxQueuedFrames, "max-queued-frames", 100, "outbound frame queue size toward Evolution")
 	flag.IntVar(&c.maxRoomReconnects, "max-room-reconnects", 2, "room_bridge.js reconnect attempts after disconnect")
+	flag.StringVar(&oc.apiBaseURL, "api", os.Getenv("EVOLUTION_API_URL"), "Evolution Go HTTP API base URL; orchestrator mode only")
+	flag.StringVar(&oc.instance, "instance", os.Getenv("EVOLUTION_INSTANCE"), "Evolution instance id/name; orchestrator mode only")
+	flag.StringVar(&oc.apiKey, "apikey", os.Getenv("EVOLUTION_INSTANCE_API_KEY"), "Evolution instance token; orchestrator mode only, never logged")
+	flag.StringVar(&oc.signingKey, "signing-key", os.Getenv("CALL_STREAM_SIGNING_KEY"), "CALL_STREAM_SIGNING_KEY for HMAC stream URL signing; orchestrator mode only")
+	flag.StringVar(&oc.webhookListen, "webhook-listen", "127.0.0.1:8090", "local webhook listen address; orchestrator mode only")
+	flag.StringVar(&oc.webhookURL, "webhook-url", "", "webhook URL reachable by Evolution; defaults to listen URL when possible")
+	flag.StringVar(&oc.rollbackWebhookURL, "rollback-webhook-url", "", "previous harness webhook URL restored after the one-call window")
+	flag.StringVar(&oc.allowedCallersCSV, "allow-caller", "", "comma-separated exact allowed CallCreator JIDs/numbers for the one inbound call")
+	flag.BoolVar(&oc.configureCutover, "configure-cutover", false, "temporarily point /instance/connect at this orchestrator and rollback afterward")
+	flag.DurationVar(&oc.offerTimeout, "offer-timeout", 2*time.Minute, "maximum time to wait for the allowlisted CallOffer")
+	flag.DurationVar(&oc.callTimeLimit, "call-time-limit", 90*time.Second, "maximum answered-call bridge duration before hangup")
+	flag.DurationVar(&oc.httpTimeout, "http-timeout", 10*time.Second, "Evolution API HTTP timeout")
+	flag.DurationVar(&oc.streamTokenTTL, "stream-token-ttl", 2*time.Minute, "short-lived HMAC stream URL TTL")
 	flag.Parse()
 
 	ctx, stop := signalContext()
 	defer stop()
-	if err := run(ctx, c); err != nil {
+	var err error
+	switch mode {
+	case "adapter":
+		err = run(ctx, c)
+	case "orchestrator":
+		oc.adapterConfig = c
+		err = runControlledInboundOrchestrator(ctx, oc)
+	default:
+		err = fmt.Errorf("-mode must be adapter or orchestrator, got %q", mode)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 }
