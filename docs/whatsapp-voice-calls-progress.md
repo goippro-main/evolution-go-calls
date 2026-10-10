@@ -14,9 +14,9 @@ This document is a durable handoff for the GoIPpro WhatsApp voice-calls work. It
 - Outbound media: `131` frames, `127` nonzero frames.
 - Result markers: `media_validation_pass` and `call_attempt_succeeded`.
 - Local private backup: `/Users/valera/whatsapp-evolution-go-stop-backups/20261010T145357+0100`, mode `drwx------ valera:staff`.
-- Backup manifest: `SHA256SUMS.txt`, manifest SHA-256 `d54448ed10a23db23347cfe9764b22f5c62e1b5af09ab4fc82bda369c3067ecf`, verified with `shasum -a 256 -c`.
-- Backup contents: live binaries, start scripts/config, LaunchAgent plists, logs, call WAV artifacts, current TTS marker WAV, git status, git bundle, redacted summary, and restore procedure.
-- Database snapshot: no runtime DB/sqlite candidate was found under the relevant live/repo paths, so no risky database dump was taken.
+- Backup manifest: `SHA256SUMS.txt`, manifest SHA-256 `3e70491904aab2ea2db8bea7f3bc9f0d71bc21f056c84bb4c2a621e62e7b37ca`, verified with `shasum -a 256 -c`.
+- Backup contents: live binaries, start scripts/config, LaunchAgent plists, logs, call WAV artifacts, current TTS marker WAV, git status, git bundle, redacted summary, restore procedure, and private restricted PostgreSQL custom dumps.
+- Private DB snapshots: `private-db/evogo_auth_whatsapp_credentials.dump` and `private-db/evogo_users_progress_runtime.dump`, both mode `600`, kept only in the local private backup. Dump contents are not published in GitHub, Notion, dispatcher, or memory.
 - Linux `.198`: intentionally unlinked for WhatsApp and untouched.
 
 Operational stop rule: do not restart services, place calls, relink/QR, edit live config, or touch Linux `.198` WhatsApp unless explicitly approved. Do not upload env/start-script contents, sessions, logs, databases, WAVs, QR material, credentials, API keys, tokens, or cookies.
