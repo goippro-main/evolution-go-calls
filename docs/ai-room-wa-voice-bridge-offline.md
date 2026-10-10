@@ -26,9 +26,15 @@ AI-Room web chat, from local repo inspection at
 - `/api/voice/rt-session` and `/api/voice/transcript`: browser/OpenAI Realtime
   path, not a direct bot participant API for a WhatsApp media bridge.
 
-Therefore the prototype uses an injectable text-agent adapter. Tests use
-`-agent=mock`. The `ai-room-http` adapter exists only for later local lab use and
-requires explicit `-allow-network`; `.198` is hard-blocked.
+Therefore the prototype uses an injectable text-agent adapter. Unit tests still
+cover `-agent=mock`; integration tests now also cover `-agent=ai-room-http`
+against a dedicated loopback AI-Room harness. That harness imports the real
+AI-Room Flask web chat route layer plus `WebBrainAgent`/`BrainAgent`, but replaces
+Postgres and OpenAI with in-memory test doubles. It verifies real Flask session
+cookies, AI-Room room identity, BrainAgent context loading across turns, HTTP
+adapter error/timeout behavior, and a full WAV -> fixed STT -> AI-Room HTTP
+agent -> tone TTS -> outbound PCM16 JSONL roundtrip. This is not production
+AI-Room and does not require secrets.
 
 ## Tool
 
@@ -87,13 +93,20 @@ Artifacts:
 
 ```bash
 go test ./tools/ai-room-voice-bridge
+go test ./...
 ```
 
 Result:
 
 ```text
 ok github.com/evolution-foundation/evolution-go/tools/ai-room-voice-bridge
+ok github.com/evolution-foundation/evolution-go/tools/ai-room-voice-bridge (within go test ./...)
 ```
+
+The AI-Room HTTP integration tests start a short-lived `127.0.0.1:<random>`
+Flask process from `/Users/valera/aicc-push/ai-room`; no service manager,
+launchd job, live port `4000`/`8090`, WhatsApp session, QR state, `.198`, or
+production AI-Room endpoint is contacted.
 
 ## Safety controls
 
@@ -104,6 +117,8 @@ ok github.com/evolution-foundation/evolution-go/tools/ai-room-voice-bridge
 - Loopback AI-Room URLs are allowed for future local lab use.
 - Non-loopback AI-Room URLs require `-allow-ai-host=<host>`.
 - `81.17.140.198` is always blocked by code.
+- Integration tests bind only random loopback ports and skip if the local
+  AI-Room source tree is unavailable.
 - Empty/silent input, empty STT, empty agent reply, and unaligned TTS output fail
   closed.
 
@@ -111,7 +126,8 @@ ok github.com/evolution-foundation/evolution-go/tools/ai-room-voice-bridge
 
 1. Explicit approval for a live test window.
 2. Decide whether AI-Room should expose a real bot participant API instead of
-   relying on the Flask web-chat session.
+   relying on the Flask web-chat session. The local harness verifies the current
+   Flask session API path, not a dedicated bot-participant API.
 3. Pick the canonical AI-Room runtime for WhatsApp voice; do not confuse the
    Mac working WhatsApp session with the separate `.198` setup.
 4. Verify local Whisper model availability and OpenAI credit state if any
