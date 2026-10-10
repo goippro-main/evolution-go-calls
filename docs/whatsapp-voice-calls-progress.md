@@ -1,6 +1,27 @@
-# WhatsApp Evolution Go handoff - 2026-10-09
+# WhatsApp Evolution Go handoff - 2026-10-10
 
 This document is a durable handoff for the GoIPpro WhatsApp voice-calls work. It records verified runtime evidence only; it intentionally contains no secrets, QR data, sessions, keys, runtime logs, databases, cookies, or phone numbers.
+
+## Verified stop point - 2026-10-10
+
+- Date/time: 2026-10-10 14:47 WEST.
+- Call ID: `007A27AF8C472B94720D093224287272`.
+- Runtime: live Mac instance `Sala 2`, branch `codex/whatsapp-voice-calls`, commit `44e037bee64d74e4bfca50e619d51097fd449f7e` (includes `f829b7f`).
+- Live services: `com.valera.evolution-go-calls` and `com.valera.wa-call-e2e-harness`.
+- Live paths: `/Users/valera/evolution-go-calls-live` and `/Users/valera/wa-call-e2e-harness-live`.
+- Human verification: English outbound TTS was heard during the real user-initiated inbound WhatsApp call.
+- Inbound media: `92` frames, `43` nonzero frames, `inboundSpanMs=7445`, `inboundStalledMs=14`, `inboundPeak=31900`.
+- Outbound media: `131` frames, `127` nonzero frames.
+- Result markers: `media_validation_pass` and `call_attempt_succeeded`.
+- Local private backup: `/Users/valera/whatsapp-evolution-go-stop-backups/20261010T145357+0100`, mode `drwx------ valera:staff`.
+- Backup manifest: `SHA256SUMS.txt`, manifest SHA-256 `d54448ed10a23db23347cfe9764b22f5c62e1b5af09ab4fc82bda369c3067ecf`, verified with `shasum -a 256 -c`.
+- Backup contents: live binaries, start scripts/config, LaunchAgent plists, logs, call WAV artifacts, current TTS marker WAV, git status, git bundle, redacted summary, and restore procedure.
+- Database snapshot: no runtime DB/sqlite candidate was found under the relevant live/repo paths, so no risky database dump was taken.
+- Linux `.198`: intentionally unlinked for WhatsApp and untouched.
+
+Operational stop rule: do not restart services, place calls, relink/QR, edit live config, or touch Linux `.198` WhatsApp unless explicitly approved. Do not upload env/start-script contents, sessions, logs, databases, WAVs, QR material, credentials, API keys, tokens, or cookies.
+
+Next stage: build the voice AI path offline first: Whisper -> Ollama `gemma3:4b` -> macOS `say`; it is not live yet.
 
 ## Confirmed spoken TTS over WhatsApp - 2026-10-09
 
