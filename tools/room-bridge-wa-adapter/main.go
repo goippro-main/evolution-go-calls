@@ -135,9 +135,11 @@ type adapterStats struct {
 
 func main() {
 	mode := "adapter"
+	rollbackStatePath := ""
 	c := config{}
 	oc := orchestratorConfig{}
 	flag.StringVar(&mode, "mode", "adapter", "run mode: adapter or orchestrator")
+	flag.StringVar(&rollbackStatePath, "rollback-state", "", "private rollback state file; rollback-watchdog mode only")
 	flag.StringVar(&c.evolutionURL, "evolution-ws-url", "", "Evolution Go /call/stream/<callId> WS URL with signed HMAC query")
 	flag.StringVar(&c.roomBridgeURL, "room-bridge-ws-url", "", "loopback/tunnel WS URL for room_bridge.js, e.g. ws://127.0.0.1:8191")
 	flag.StringVar(&c.callID, "call-id", "", "optional explicit callId; default is parsed from Evolution stream path")
@@ -163,6 +165,7 @@ func main() {
 	flag.BoolVar(&oc.configureCutover, "configure-cutover", false, "temporarily point /instance/connect at this orchestrator and rollback afterward")
 	flag.DurationVar(&oc.offerTimeout, "offer-timeout", 2*time.Minute, "maximum time to wait for the allowlisted CallOffer")
 	flag.DurationVar(&oc.callTimeLimit, "call-time-limit", 90*time.Second, "maximum answered-call bridge duration before hangup")
+	flag.DurationVar(&oc.rollbackWatchdogAfter, "crash-rollback-after", 4*time.Minute, "maximum cutover window before independent crash rollback restores previous webhook")
 	flag.DurationVar(&oc.httpTimeout, "http-timeout", 10*time.Second, "Evolution API HTTP timeout")
 	flag.DurationVar(&oc.streamTokenTTL, "stream-token-ttl", 2*time.Minute, "short-lived HMAC stream URL TTL")
 	flag.Parse()
@@ -176,8 +179,10 @@ func main() {
 	case "orchestrator":
 		oc.adapterConfig = c
 		err = runControlledInboundOrchestrator(ctx, oc)
+	case "rollback-watchdog":
+		err = runRollbackWatchdog(ctx, rollbackStatePath)
 	default:
-		err = fmt.Errorf("-mode must be adapter or orchestrator, got %q", mode)
+		err = fmt.Errorf("-mode must be adapter, orchestrator, or rollback-watchdog, got %q", mode)
 	}
 	if err != nil {
 		log.Fatal(err)

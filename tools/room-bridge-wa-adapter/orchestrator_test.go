@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,18 +94,20 @@ func TestControlledInboundOrchestratorBridgesOneAllowlistedCallAndRollsBack(t *t
 	defer evoServer.Close()
 
 	err := runControlledInboundOrchestrator(t.Context(), orchestratorConfig{
-		apiBaseURL:         evoServer.URL,
-		instance:           "sala2",
-		apiKey:             "instance-secret",
-		signingKey:         "signing-secret",
-		webhookListen:      "127.0.0.1:0",
-		rollbackWebhookURL: "http://127.0.0.1:8090/webhook",
-		allowedCallersCSV:  "351900000001@s.whatsapp.net",
-		configureCutover:   true,
-		offerTimeout:       2 * time.Second,
-		callTimeLimit:      3 * time.Second,
-		httpTimeout:        time.Second,
-		streamTokenTTL:     time.Minute,
+		apiBaseURL:            evoServer.URL,
+		instance:              "sala2",
+		apiKey:                "instance-secret",
+		signingKey:            "signing-secret",
+		webhookListen:         "127.0.0.1:0",
+		rollbackWebhookURL:    "http://127.0.0.1:8090/webhook",
+		allowedCallersCSV:     "351900000001@s.whatsapp.net",
+		configureCutover:      true,
+		rollbackWatchdogAfter: time.Minute,
+		watchdogStarter:       noOpRollbackWatchdogStarter,
+		offerTimeout:          2 * time.Second,
+		callTimeLimit:         3 * time.Second,
+		httpTimeout:           time.Second,
+		streamTokenTTL:        time.Minute,
 		adapterConfig: config{
 			roomBridgeURL:     wsURLFromHTTP(roomServer.URL),
 			dir:               "pt2ru",
@@ -166,19 +170,21 @@ func TestControlledInboundOrchestratorIgnoresNonAllowlistedOfferAndRollsBack(t *
 	defer evoServer.Close()
 
 	err := runControlledInboundOrchestrator(t.Context(), orchestratorConfig{
-		apiBaseURL:         evoServer.URL,
-		instance:           "sala2",
-		apiKey:             "instance-secret",
-		signingKey:         "signing-secret",
-		webhookListen:      "127.0.0.1:0",
-		rollbackWebhookURL: "http://127.0.0.1:8090/webhook",
-		allowedCallersCSV:  "351900000001@s.whatsapp.net",
-		configureCutover:   true,
-		offerTimeout:       100 * time.Millisecond,
-		callTimeLimit:      time.Second,
-		httpTimeout:        time.Second,
-		streamTokenTTL:     time.Minute,
-		adapterConfig:      validOrchestratorAdapterConfig(t, "ws://127.0.0.1:8191"),
+		apiBaseURL:            evoServer.URL,
+		instance:              "sala2",
+		apiKey:                "instance-secret",
+		signingKey:            "signing-secret",
+		webhookListen:         "127.0.0.1:0",
+		rollbackWebhookURL:    "http://127.0.0.1:8090/webhook",
+		allowedCallersCSV:     "351900000001@s.whatsapp.net",
+		configureCutover:      true,
+		rollbackWatchdogAfter: time.Minute,
+		watchdogStarter:       noOpRollbackWatchdogStarter,
+		offerTimeout:          100 * time.Millisecond,
+		callTimeLimit:         time.Second,
+		httpTimeout:           time.Second,
+		streamTokenTTL:        time.Minute,
+		adapterConfig:         validOrchestratorAdapterConfig(t, "ws://127.0.0.1:8191"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "wait for allowlisted inbound CallOffer") {
 		t.Fatalf("expected allowlist timeout, got %v", err)
@@ -193,19 +199,21 @@ func TestControlledInboundOrchestratorAnswerFailureRollsBackWithoutStream(t *tes
 	defer evoServer.Close()
 
 	err := runControlledInboundOrchestrator(t.Context(), orchestratorConfig{
-		apiBaseURL:         evoServer.URL,
-		instance:           "sala2",
-		apiKey:             "instance-secret",
-		signingKey:         "signing-secret",
-		webhookListen:      "127.0.0.1:0",
-		rollbackWebhookURL: "http://127.0.0.1:8090/webhook",
-		allowedCallersCSV:  "351900000001@s.whatsapp.net",
-		configureCutover:   true,
-		offerTimeout:       time.Second,
-		callTimeLimit:      time.Second,
-		httpTimeout:        time.Second,
-		streamTokenTTL:     time.Minute,
-		adapterConfig:      validOrchestratorAdapterConfig(t, "ws://127.0.0.1:8191"),
+		apiBaseURL:            evoServer.URL,
+		instance:              "sala2",
+		apiKey:                "instance-secret",
+		signingKey:            "signing-secret",
+		webhookListen:         "127.0.0.1:0",
+		rollbackWebhookURL:    "http://127.0.0.1:8090/webhook",
+		allowedCallersCSV:     "351900000001@s.whatsapp.net",
+		configureCutover:      true,
+		rollbackWatchdogAfter: time.Minute,
+		watchdogStarter:       noOpRollbackWatchdogStarter,
+		offerTimeout:          time.Second,
+		callTimeLimit:         time.Second,
+		httpTimeout:           time.Second,
+		streamTokenTTL:        time.Minute,
+		adapterConfig:         validOrchestratorAdapterConfig(t, "ws://127.0.0.1:8191"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "answer inbound call") {
 		t.Fatalf("expected answer failure, got %v", err)
@@ -229,11 +237,34 @@ func TestControlledInboundOrchestratorRoomFailureHangsUpAndRollsBack(t *testing.
 	defer evoServer.Close()
 
 	err := runControlledInboundOrchestrator(t.Context(), orchestratorConfig{
-		apiBaseURL:         evoServer.URL,
+		apiBaseURL:            evoServer.URL,
+		instance:              "sala2",
+		apiKey:                "instance-secret",
+		signingKey:            "signing-secret",
+		webhookListen:         "127.0.0.1:0",
+		rollbackWebhookURL:    "http://127.0.0.1:8090/webhook",
+		allowedCallersCSV:     "351900000001@s.whatsapp.net",
+		configureCutover:      true,
+		rollbackWatchdogAfter: time.Minute,
+		watchdogStarter:       noOpRollbackWatchdogStarter,
+		offerTimeout:          time.Second,
+		callTimeLimit:         time.Second,
+		httpTimeout:           time.Second,
+		streamTokenTTL:        time.Minute,
+		adapterConfig:         validOrchestratorAdapterConfig(t, wsURLFromHTTP(roomServer.URL)),
+	})
+	if err == nil {
+		t.Fatal("expected room bridge failure")
+	}
+	state.assertCounts(t, 2, 1, 1, 1)
+}
+
+func TestValidateOrchestratorRequiresCrashRollbackForCutover(t *testing.T) {
+	cfg := orchestratorConfig{
+		apiBaseURL:         "http://127.0.0.1:4000",
 		instance:           "sala2",
 		apiKey:             "instance-secret",
 		signingKey:         "signing-secret",
-		webhookListen:      "127.0.0.1:0",
 		rollbackWebhookURL: "http://127.0.0.1:8090/webhook",
 		allowedCallersCSV:  "351900000001@s.whatsapp.net",
 		configureCutover:   true,
@@ -241,12 +272,58 @@ func TestControlledInboundOrchestratorRoomFailureHangsUpAndRollsBack(t *testing.
 		callTimeLimit:      time.Second,
 		httpTimeout:        time.Second,
 		streamTokenTTL:     time.Minute,
-		adapterConfig:      validOrchestratorAdapterConfig(t, wsURLFromHTTP(roomServer.URL)),
-	})
-	if err == nil {
-		t.Fatal("expected room bridge failure")
+		adapterConfig:      validOrchestratorAdapterConfig(t, "ws://127.0.0.1:8191"),
 	}
-	state.assertCounts(t, 2, 1, 1, 1)
+	if _, err := validateOrchestratorConfig(cfg); err == nil || !strings.Contains(err.Error(), "crash-rollback") {
+		t.Fatalf("expected crash rollback validation error, got %v", err)
+	}
+}
+
+func TestRollbackWebhookPostAndStateFile(t *testing.T) {
+	var gotAPIKey string
+	var gotWebhook string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/instance/connect" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		gotAPIKey = r.Header.Get("apikey")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		gotWebhook, _ = body["webhookUrl"].(string)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer server.Close()
+
+	statePath := t.TempDir() + "/rollback.json"
+	state := rollbackWatchdogState{
+		APIBaseURL:         server.URL,
+		APIKey:             "instance-secret",
+		RollbackWebhookURL: "http://127.0.0.1:8090/webhook",
+		DeadlineUnixNano:   time.Now().UnixNano(),
+		HTTPTimeoutMillis:  int64(time.Second / time.Millisecond),
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readRollbackWatchdogState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postRollbackWebhook(t.Context(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	if gotAPIKey != "instance-secret" {
+		t.Fatalf("apikey not sent to rollback endpoint")
+	}
+	if gotWebhook != "http://127.0.0.1:8090/webhook" {
+		t.Fatalf("webhook = %q", gotWebhook)
+	}
 }
 
 func validOrchestratorAdapterConfig(t *testing.T, roomURL string) config {
@@ -264,6 +341,10 @@ func validOrchestratorAdapterConfig(t *testing.T, roomURL string) config {
 		maxQueuedFrames:   2,
 		maxRoomReconnects: 0,
 	}
+}
+
+func noOpRollbackWatchdogStarter(context.Context, orchestratorConfig) (func(bool), error) {
+	return func(bool) {}, nil
 }
 
 type mockEvolutionState struct {

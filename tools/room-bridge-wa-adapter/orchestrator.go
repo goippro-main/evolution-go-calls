@@ -14,27 +14,31 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
 
 type orchestratorConfig struct {
-	apiBaseURL         string
-	instance           string
-	apiKey             string
-	signingKey         string
-	webhookListen      string
-	webhookURL         string
-	rollbackWebhookURL string
-	allowedCallersCSV  string
-	configureCutover   bool
-	offerTimeout       time.Duration
-	callTimeLimit      time.Duration
-	httpTimeout        time.Duration
-	streamTokenTTL     time.Duration
-	adapterConfig      config
-	allowedCallers     map[string]struct{}
+	apiBaseURL            string
+	instance              string
+	apiKey                string
+	signingKey            string
+	webhookListen         string
+	webhookURL            string
+	rollbackWebhookURL    string
+	allowedCallersCSV     string
+	configureCutover      bool
+	offerTimeout          time.Duration
+	callTimeLimit         time.Duration
+	rollbackWatchdogAfter time.Duration
+	httpTimeout           time.Duration
+	streamTokenTTL        time.Duration
+	adapterConfig         config
+	allowedCallers        map[string]struct{}
+	watchdogStarter       func(context.Context, orchestratorConfig) (func(bool), error)
 }
 
 type inboundOffer struct {
@@ -87,8 +91,14 @@ func runControlledInboundOrchestrator(ctx context.Context, c orchestratorConfig)
 	}()
 
 	rollbackNeeded := false
+	var cleanupWatchdog func(bool)
 	if o.c.configureCutover {
+		cleanupWatchdog, err = o.startRollbackWatchdog(ctx)
+		if err != nil {
+			return err
+		}
 		if err := o.configureWebhook(ctx, o.c.webhookURL); err != nil {
+			cleanupWatchdog(false)
 			return fmt.Errorf("configure orchestrator webhook: %w", err)
 		}
 		rollbackNeeded = true
@@ -98,8 +108,14 @@ func runControlledInboundOrchestrator(ctx context.Context, c orchestratorConfig)
 		if rollbackNeeded {
 			if err := o.configureWebhook(context.Background(), o.c.rollbackWebhookURL); err != nil {
 				log.Printf("orchestrator rollback failed: %v", err)
+				if cleanupWatchdog != nil {
+					cleanupWatchdog(false)
+				}
 			} else {
 				log.Printf("orchestrator rollback restored previous webhook")
+				if cleanupWatchdog != nil {
+					cleanupWatchdog(true)
+				}
 			}
 		}
 	}()
@@ -201,6 +217,9 @@ func validateOrchestratorConfig(c orchestratorConfig) (orchestratorConfig, error
 	if c.offerTimeout <= 0 || c.callTimeLimit <= 0 || c.httpTimeout <= 0 || c.streamTokenTTL <= 0 {
 		return c, errors.New("orchestrator timeouts and stream token TTL must be positive")
 	}
+	if c.configureCutover && c.rollbackWatchdogAfter <= 0 {
+		return c, errors.New("-crash-rollback-after must be positive with -configure-cutover")
+	}
 	if c.adapterConfig.maxQueuedFrames <= 0 {
 		return c, errors.New("-max-queued-frames must be positive")
 	}
@@ -215,6 +234,13 @@ func validateOrchestratorConfig(c orchestratorConfig) (orchestratorConfig, error
 		return c, errors.New("-allow-caller must name at least one allowed inbound CallCreator")
 	}
 	return c, nil
+}
+
+func (o *controlledOrchestrator) startRollbackWatchdog(ctx context.Context) (func(bool), error) {
+	if o.c.watchdogStarter != nil {
+		return o.c.watchdogStarter(ctx, o.c)
+	}
+	return startRollbackWatchdogProcess(ctx, o.c)
 }
 
 func parseAllowlist(raw string) map[string]struct{} {
@@ -377,6 +403,182 @@ func (o *controlledOrchestrator) post(ctx context.Context, path string, body any
 		if err := json.Unmarshal(bodyBytes, result); err != nil {
 			return fmt.Errorf("%s: invalid JSON response: %w", path, err)
 		}
+	}
+	return nil
+}
+
+type rollbackWatchdogState struct {
+	APIBaseURL         string `json:"apiBaseUrl"`
+	APIKey             string `json:"apiKey"`
+	RollbackWebhookURL string `json:"rollbackWebhookUrl"`
+	DeadlineUnixNano   int64  `json:"deadlineUnixNano"`
+	RetryUntilUnixNano int64  `json:"retryUntilUnixNano"`
+	HTTPTimeoutMillis  int64  `json:"httpTimeoutMillis"`
+}
+
+func startRollbackWatchdogProcess(ctx context.Context, c orchestratorConfig) (func(bool), error) {
+	if c.adapterConfig.lockDir == "" {
+		return nil, errors.New("rollback watchdog requires -lock-dir")
+	}
+	if err := os.MkdirAll(c.adapterConfig.lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("create watchdog lock dir: %w", err)
+	}
+	deadline := time.Now().Add(c.rollbackWatchdogAfter)
+	state := rollbackWatchdogState{
+		APIBaseURL:         c.apiBaseURL,
+		APIKey:             c.apiKey,
+		RollbackWebhookURL: c.rollbackWebhookURL,
+		DeadlineUnixNano:   deadline.UnixNano(),
+		RetryUntilUnixNano: deadline.Add(30 * time.Second).UnixNano(),
+		HTTPTimeoutMillis:  c.httpTimeout.Milliseconds(),
+	}
+	statePath := filepath.Join(c.adapterConfig.lockDir, fmt.Sprintf(".wa-room-bridge-rollback-%d-%d.json", os.Getpid(), time.Now().UnixNano()))
+	file, err := os.OpenFile(statePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("create rollback state: %w", err)
+	}
+	encodeErr := json.NewEncoder(file).Encode(state)
+	closeErr := file.Close()
+	if encodeErr != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("write rollback state: %w", encodeErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("close rollback state: %w", closeErr)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("find executable for rollback watchdog: %w", err)
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+	if err != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("open devnull: %w", err)
+	}
+	defer devNull.Close()
+	logPath := statePath + ".log"
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("open rollback watchdog log: %w", err)
+	}
+	defer logFile.Close()
+	proc, err := os.StartProcess(exe, []string{exe, "-mode", "rollback-watchdog", "-rollback-state", statePath}, &os.ProcAttr{
+		Env:   os.Environ(),
+		Files: []*os.File{devNull, logFile, logFile},
+	})
+	if err != nil {
+		_ = os.Remove(statePath)
+		return nil, fmt.Errorf("start rollback watchdog: %w", err)
+	}
+	_ = proc.Release()
+	log.Printf("orchestrator crash rollback watchdog armed deadline=%s", deadline.UTC().Format(time.RFC3339))
+	return func(rollbackConfirmed bool) {
+		if rollbackConfirmed {
+			_ = os.Remove(statePath)
+			_ = os.Remove(logPath)
+		}
+	}, nil
+}
+
+func runRollbackWatchdog(ctx context.Context, statePath string) error {
+	if statePath == "" {
+		return errors.New("-rollback-state is required")
+	}
+	state, err := readRollbackWatchdogState(statePath)
+	if err != nil {
+		return err
+	}
+	deadline := time.Unix(0, state.DeadlineUnixNano)
+	wait := time.Until(deadline)
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	for {
+		if _, err := os.Stat(statePath); errors.Is(err, os.ErrNotExist) {
+			log.Printf("rollback watchdog cancelled")
+			return nil
+		}
+		if err := postRollbackWebhook(ctx, state); err == nil {
+			_ = os.Remove(statePath)
+			_ = os.Remove(statePath + ".log")
+			log.Printf("rollback watchdog restored previous webhook")
+			return nil
+		} else {
+			log.Printf("rollback watchdog attempt failed: %v", err)
+		}
+		if time.Now().After(time.Unix(0, state.RetryUntilUnixNano)) {
+			return errors.New("rollback watchdog retry deadline elapsed")
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func readRollbackWatchdogState(path string) (rollbackWatchdogState, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return rollbackWatchdogState{}, fmt.Errorf("open rollback state: %w", err)
+	}
+	defer file.Close()
+	var state rollbackWatchdogState
+	if err := json.NewDecoder(io.LimitReader(file, 64<<10)).Decode(&state); err != nil {
+		return rollbackWatchdogState{}, fmt.Errorf("decode rollback state: %w", err)
+	}
+	if state.APIBaseURL == "" || state.APIKey == "" || state.RollbackWebhookURL == "" || state.DeadlineUnixNano == 0 {
+		return rollbackWatchdogState{}, errors.New("rollback state is incomplete")
+	}
+	if state.HTTPTimeoutMillis <= 0 {
+		state.HTTPTimeoutMillis = int64((10 * time.Second).Milliseconds())
+	}
+	if state.RetryUntilUnixNano == 0 {
+		state.RetryUntilUnixNano = time.Unix(0, state.DeadlineUnixNano).Add(30 * time.Second).UnixNano()
+	}
+	return state, nil
+}
+
+func postRollbackWebhook(ctx context.Context, state rollbackWatchdogState) error {
+	body := map[string]any{
+		"webhookUrl": state.RollbackWebhookURL,
+		"subscribe":  []string{"CALL"},
+		"immediate":  true,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: time.Duration(state.HTTPTimeoutMillis) * time.Millisecond}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(state.APIBaseURL, "/")+"/instance/connect", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", state.APIKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("rollback /instance/connect: %s: %s", resp.Status, strings.TrimSpace(string(bodyBytes)))
 	}
 	return nil
 }
