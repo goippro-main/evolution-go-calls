@@ -78,6 +78,65 @@ func TestAudioPlayoutDoesNotReplayElapsedGap(t *testing.T) {
 	}
 }
 
+func TestAudioPlayoutFlushPendingAfterIdleBurst(t *testing.T) {
+	playout := newAudioPlayoutBuffer()
+	sink := &playoutTestSink{}
+	first := constantPCM(FrameSamples, 0.1)
+	second := constantPCM(FrameSamples, 0.2)
+	tail := constantPCM(FrameSamples, 0.3)
+
+	for _, push := range []struct {
+		ts    uint32
+		frame []float32
+	}{
+		{0, first},
+		{FrameSamples, second},
+		{2 * FrameSamples, tail},
+	} {
+		if _, err := playout.Push(push.ts, push.frame, sink); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(sink.frames) != 2 {
+		t.Fatalf("prefill writes = %d, want 2", len(sink.frames))
+	}
+	flushed, err := playout.FlushPending(sink)
+	if err != nil || !flushed {
+		t.Fatalf("flush pending = (%v, %v), want (true, nil)", flushed, err)
+	}
+	if len(sink.frames) != 3 {
+		t.Fatalf("writes after flush = %d, want 3", len(sink.frames))
+	}
+	if sink.frames[2][0] != 0.3 {
+		t.Fatalf("flushed frame starts with %f, want 0.3", sink.frames[2][0])
+	}
+	flushed, err = playout.FlushPending(sink)
+	if err != nil || flushed {
+		t.Fatalf("second flush pending = (%v, %v), want (false, nil)", flushed, err)
+	}
+	if len(sink.frames) != 3 {
+		t.Fatalf("second flush wrote duplicate frame: %d", len(sink.frames))
+	}
+}
+
+func TestAudioPlayoutFlushPendingBeforeStartIsNoop(t *testing.T) {
+	playout := newAudioPlayoutBuffer()
+	sink := &playoutTestSink{}
+	if _, err := playout.Push(0, constantPCM(FrameSamples, 0.4), sink); err != nil {
+		t.Fatal(err)
+	}
+	flushed, err := playout.FlushPending(sink)
+	if err != nil || flushed {
+		t.Fatalf("flush pending before start = (%v, %v), want (false, nil)", flushed, err)
+	}
+	if len(sink.frames) != 0 {
+		t.Fatalf("flush before start wrote %d frames", len(sink.frames))
+	}
+	if playout.pending == nil {
+		t.Fatal("flush before start dropped pending prefill frame")
+	}
+}
+
 func TestAlignAudioFrameKeepsNaturalMultiFrameOutput(t *testing.T) {
 	frame := make([]float32, 2*FrameSamples)
 	aligned := alignAudioFrame(frame, 8*FrameSamples)

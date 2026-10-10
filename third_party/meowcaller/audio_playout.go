@@ -71,12 +71,17 @@ func (p *audioPlayoutBuffer) Push(timestamp uint32, frame []float32, sink AudioS
 }
 
 func (p *audioPlayoutBuffer) Flush(sink AudioSink) error {
+	_, err := p.FlushPending(sink)
+	return err
+}
+
+func (p *audioPlayoutBuffer) FlushPending(sink AudioSink) (bool, error) {
 	if !p.started || p.pending == nil || sink == nil {
-		return nil
+		return false, nil
 	}
 	err := sink.WriteFrame(p.pending.pcm)
 	p.pending = nil
-	return err
+	return err == nil, err
 }
 
 func (p *audioPlayoutBuffer) Drain(sink AudioSink) error {

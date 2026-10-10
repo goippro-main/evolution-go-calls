@@ -373,6 +373,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	audioPlayout := newAudioPlayoutBuffer()
 	var audioPlayoutMu sync.Mutex
 	var groupMixing atomic.Bool
+	var lastDirectAudioDecodedUnixNano atomic.Int64
+	var directAudioDecodedGeneration atomic.Uint64
+	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	defer func() {
 		if groupMixing.Load() {
 			return
@@ -384,6 +387,45 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 	audioMixer := newParticipantAudioMixer()
 	var audioSinkFramer participantAudioSinkFramer
+	go func() {
+		ticker := time.NewTicker(frameInterval)
+		defer ticker.Stop()
+		var lastFlushedGeneration uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if groupMixing.Load() {
+				continue
+			}
+			generation := directAudioDecodedGeneration.Load()
+			if generation == 0 || generation == lastFlushedGeneration {
+				continue
+			}
+			lastDecoded := lastDirectAudioDecodedUnixNano.Load()
+			if lastDecoded == 0 {
+				continue
+			}
+			idleFor := time.Since(time.Unix(0, lastDecoded))
+			if idleFor < 2*frameInterval {
+				continue
+			}
+			audioPlayoutMu.Lock()
+			_, sink := callPlayerSink(call)
+			flushed, err := audioPlayout.FlushPending(sink)
+			audioPlayoutMu.Unlock()
+			if err != nil {
+				log.Warn().Err(err).Msg("failed to flush timestamp-aligned WhatsApp audio after RTP idle")
+				continue
+			}
+			if flushed {
+				lastFlushedGeneration = generation
+				log.Debug().Dur("idle_for", idleFor).Msg("flushed inbound audio tail after RTP idle")
+			}
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(time.Duration(participantAudioMixChunkSamples) * time.Second / SampleRate)
 		defer ticker.Stop()
@@ -593,7 +635,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// on relay connection and the relay learns our SSRC from our FIRST RTP — it won't
 	// bridge the peer's media until it sees our stream. So we send silence frames until the
 	// Player has real audio (nextFrame() == nil means send silence).
-	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	go func() {
 		silence := make([]float32, FrameSamples)
 		ticker := time.NewTicker(frameInterval)
@@ -1176,6 +1217,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if mixedMode {
 			audioMixer.Add(audio.ParticipantID, audio.PCM)
 		} else {
+			lastDirectAudioDecodedUnixNano.Store(time.Now().UnixNano())
+			directAudioDecodedGeneration.Add(1)
 			_, sink := callPlayerSink(call)
 			playoutStarted, playoutErr := audioPlayout.Push(audio.Timestamp, audio.PCM, sink)
 			if playoutErr != nil {
