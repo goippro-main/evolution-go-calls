@@ -74,7 +74,7 @@ type recorder struct {
 	file                                                         *os.File
 	path                                                         string
 	samples, frames, nonZeroFrames, silentFrames, nonZeroSamples int64
-	peak                                                         int16
+	peak                                                         int64
 	first, last                                                  time.Time
 }
 
@@ -715,7 +715,7 @@ func (r *recorder) add(raw []byte) error {
 	nonZero := false
 	for i := 0; i < len(raw); i += 2 {
 		sample := int16(binary.LittleEndian.Uint16(raw[i:]))
-		abs := sample
+		abs := int64(sample)
 		if abs < 0 {
 			abs = -abs
 		}

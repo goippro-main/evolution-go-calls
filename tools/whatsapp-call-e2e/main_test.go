@@ -254,6 +254,36 @@ func TestPositiveCounterSupportsJSONNumbers(t *testing.T) {
 	}
 }
 
+func TestRecorderPeakSummaryIsUsableForValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.wav")
+	rec, err := newRecorder(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.close()
+
+	frame := make([]byte, frameBytes)
+	sample := int16(-1200)
+	for i := 0; i < frameSamples; i++ {
+		binary.LittleEndian.PutUint16(frame[i*2:], uint16(sample))
+	}
+	for i := 0; i < 3; i++ {
+		if err := rec.add(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary := rec.summary()
+	if got := positiveCounter(summary, "peak"); got != 1200 {
+		t.Fatalf("positiveCounter(summary peak) = %d, want 1200; summary=%#v", got, summary)
+	}
+	if err := validateMedia("inbound", summary, map[string]any{
+		"outboundFrames": int64(3), "outboundNonZeroFrames": int64(3), "outboundNonZeroSamples": int64(1200), "outboundPeak": int64(1200),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMarkerToneIsIdentifiableAndFrameAligned(t *testing.T) {
 	samples, name, err := outbound("tone", "")
 	if err != nil {
